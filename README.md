@@ -5,7 +5,7 @@ Plugin Screenshot <img width="1918" height="867" alt="main site" src="https://gi
 
 
 
-A powerful, privacy-friendly YouTube plugin for [Emby](https://emby.media/) that operates entirely without Google API keys. It uses an Invidious instance (ideally self-hosted) to seamlessly integrate channels, playlists, and search queries directly into your Emby dashboard.
+A powerful, privacy-friendly [Invidious](https://github.com/iv-org/invidious/) plugin for [Emby](https://emby.media/) that operates entirely without Google API keys. It uses an Invidious instance (ideally self-hosted) to seamlessly integrate channels, playlists, and search queries directly into your Emby dashboard.
 
 ## ✨ Features
 
