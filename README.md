@@ -58,7 +58,7 @@ To fetch new videos from your saved channels and playlists, Emby uses an automat
 ## 🛠️ For Developers (Compiling)
 1. Clone this repository.
 2. Open the project in Visual Studio.
-3. Ensure you have the required Emby Server references added (`MediaBrowser.Common`, `MediaBrowser.Controller`, `MediaBrowser.Model`).
+3. Ensure you have the required Emby Server references added (`MediaBrowser.Server.Core`).
 4. Build the project as a Class Library.
 
 ## 💖 Donate
