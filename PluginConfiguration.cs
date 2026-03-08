@@ -7,19 +7,18 @@ namespace Emby.InvidiousPlugin
     {
         public override string EditorTitle => "Invidious Settings";
 
-        [DisplayName("Invidious Instance URL")]
-        public string InvidiousUrl { get; set; } = "https://yewtu.be";
+        [DisplayName("My Invidious Instance URL")]
+        [Description("Enter the URL of your self-hosted instance (e.g., http://invidious:3000)")]
+        public string InvidiousUrl { get; set; } = "http://localhost:3000";
 
-        [DisplayName("My Search Terms (Comma-separated)")]
-        [Description("e.g., Minecraft, News, Trailer")]
-        public string SavedSearches { get; set; } = "Minecraft, Trailer";
+        [DisplayName("Max Videos for Channels/Playlists")]
+        public int MaxChannelVideos { get; set; } = 60;
 
-        [DisplayName("My Channels (Channel IDs, Comma-separated)")]
-        [Description("IMPORTANT: Use the Channel ID (usually starts with UC...). e.g., UCBcRF18a7Qf58cCRy5xgHKQ")]
-        public string SavedChannels { get; set; } = "";
+        [DisplayName("Max Videos for Search")]
+        public int MaxSearchVideos { get; set; } = 150;
 
-        [DisplayName("My Playlists (Playlist IDs, Comma-separated)")]
-        [Description("IMPORTANT: Use the Playlist ID (usually starts with PL...). e.g., PLBCF2DAC6FFB574DE")]
-        public string SavedPlaylists { get; set; } = "";
+        [DisplayName("My YouTube Content (Comma-separated)")]
+        [Description("Channels: @Handle | Playlists: PL... | Searches: regular words")]
+        public string SavedItems { get; set; } = "@GitHub, PL0lo9MOBetEFcp4SCWinBdpml9B2U25-f, Minecraft Trailer";
     }
 }

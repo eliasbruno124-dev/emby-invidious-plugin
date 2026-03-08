@@ -45,6 +45,80 @@ namespace Emby.InvidiousPlugin
             return await JsonDocument.ParseAsync(s, cancellationToken: ct).ConfigureAwait(false);
         }
 
+        
+        public async Task<(string? id, string? name, string? thumb)> GetChannelDetailsAsync(string baseUrl, string query, bool isHandle, CancellationToken ct)
+        {
+            try
+            {
+                if (isHandle)
+                {
+                    var q = Uri.EscapeDataString(query);
+                    using var doc = await GetJsonAsync(baseUrl, $"api/v1/search?q={q}&type=channel", ct).ConfigureAwait(false);
+                    var root = doc.RootElement;
+                    if (root.ValueKind == JsonValueKind.Array && root.GetArrayLength() > 0)
+                    {
+                        var first = root[0];
+                        var authorId = GetString(first, "authorId");
+                        var author = GetString(first, "author");
+                        var thumb = GetHighestResThumb(first, "authorThumbnails");
+                        return (authorId, author, thumb);
+                    }
+                }
+                else
+                {
+                    var id = Uri.EscapeDataString(query);
+                    using var doc = await GetJsonAsync(baseUrl, $"api/v1/channels/{id}", ct).ConfigureAwait(false);
+                    var root = doc.RootElement;
+                    var author = GetString(root, "author");
+                    var thumb = GetHighestResThumb(root, "authorThumbnails");
+                    return (id, author, thumb);
+                }
+            }
+            catch { }
+            return (null, null, null);
+        }
+
+        
+        public async Task<(string? name, string? thumb)> GetPlaylistDetailsAsync(string baseUrl, string id, CancellationToken ct)
+        {
+            try
+            {
+                var escId = Uri.EscapeDataString(id);
+                using var doc = await GetJsonAsync(baseUrl, $"api/v1/playlists/{escId}", ct).ConfigureAwait(false);
+                var root = doc.RootElement;
+                var title = GetString(root, "title");
+                var thumb = GetHighestResThumb(root, "playlistThumbnails");
+                return (title, thumb);
+            }
+            catch { }
+            return (null, null);
+        }
+
+        
+        private static string? GetHighestResThumb(JsonElement el, string propertyName)
+        {
+            if (el.TryGetProperty(propertyName, out var arr) && arr.ValueKind == JsonValueKind.Array)
+            {
+                string? bestUrl = null;
+                int bestWidth = 0;
+                foreach (var thumb in arr.EnumerateArray())
+                {
+                    var url = GetString(thumb, "url");
+                    if (string.IsNullOrWhiteSpace(url)) continue;
+                    if (url.StartsWith("//")) url = "https:" + url;
+
+                    var w = GetInt(thumb, "width") ?? 0;
+                    if (w >= bestWidth)
+                    {
+                        bestWidth = w;
+                        bestUrl = url;
+                    }
+                }
+                return bestUrl;
+            }
+            return null;
+        }
+
         public Task<JsonDocument> SearchVideosAsync(string baseUrl, string query, int page, CancellationToken ct)
         {
             var q = Uri.EscapeDataString(query ?? "");
@@ -54,7 +128,7 @@ namespace Emby.InvidiousPlugin
         public Task<JsonDocument> GetChannelVideosAsync(string baseUrl, string channelId, int page, CancellationToken ct)
         {
             var id = Uri.EscapeDataString(channelId ?? "");
-            return GetJsonAsync(baseUrl, $"api/v1/channels/{id}?page={page}", ct);
+            return GetJsonAsync(baseUrl, $"api/v1/channels/{id}/videos?page={page}", ct);
         }
 
         public Task<JsonDocument> GetPlaylistVideosAsync(string baseUrl, string playlistId, int page, CancellationToken ct)
@@ -63,34 +137,22 @@ namespace Emby.InvidiousPlugin
             return GetJsonAsync(baseUrl, $"api/v1/playlists/{id}?page={page}", ct);
         }
 
-        // NEU: Holt die Kanal-Details (für den echten Namen)
-        public Task<JsonDocument> GetChannelDetailsAsync(string baseUrl, string channelId, CancellationToken ct)
-        {
-            var id = Uri.EscapeDataString(channelId ?? "");
-            return GetJsonAsync(baseUrl, $"api/v1/channels/{id}", ct);
-        }
-
-        // NEU: Holt die Playlist-Details (für den echten Namen)
-        public Task<JsonDocument> GetPlaylistDetailsAsync(string baseUrl, string playlistId, CancellationToken ct)
-        {
-            var id = Uri.EscapeDataString(playlistId ?? "");
-            return GetJsonAsync(baseUrl, $"api/v1/playlists/{id}", ct);
-        }
-
-        public Task<JsonDocument> GetPopularAsync(string baseUrl, CancellationToken ct)
-        {
-            return GetJsonAsync(baseUrl, "api/v1/popular", ct);
-        }
-
         public Task<JsonDocument> GetVideoAsync(string baseUrl, string videoId, CancellationToken ct)
         {
             var id = Uri.EscapeDataString(videoId ?? "");
             return GetJsonAsync(baseUrl, $"api/v1/videos/{id}", ct);
         }
 
-        public string? SelectBestStreamUrl(JsonDocument videoDoc)
+        public (string? mp4, string? dash, string? hls) ExtractAllStreams(string baseUrl, JsonDocument videoDoc)
         {
             var root = videoDoc.RootElement;
+
+            string? dashUrl = GetString(root, "dashUrl");
+            if (!string.IsNullOrEmpty(dashUrl) && dashUrl.StartsWith("/")) dashUrl = baseUrl + dashUrl;
+
+            string? hlsUrl = GetString(root, "hlsUrl");
+            if (!string.IsNullOrEmpty(hlsUrl) && hlsUrl.StartsWith("/")) hlsUrl = baseUrl + hlsUrl;
+
             var candidates = new List<(string url, int bitrate, string container)>();
 
             if (root.TryGetProperty("formatStreams", out var arr) && arr.ValueKind == JsonValueKind.Array)
@@ -105,12 +167,16 @@ namespace Emby.InvidiousPlugin
                 }
             }
 
-            if (candidates.Count == 0) return null;
+            string? mp4Url = null;
+            if (candidates.Count > 0)
+            {
+                mp4Url = candidates
+                    .Where(c => c.container.ToLowerInvariant().Contains("mp4"))
+                    .OrderByDescending(c => c.bitrate)
+                    .FirstOrDefault().url ?? candidates.OrderByDescending(c => c.bitrate).First().url;
+            }
 
-            return candidates
-                .Where(c => c.container.ToLowerInvariant().Contains("mp4"))
-                .OrderByDescending(c => c.bitrate)
-                .FirstOrDefault().url ?? candidates.OrderByDescending(c => c.bitrate).First().url;
+            return (mp4Url, dashUrl, hlsUrl);
         }
 
         public static Dictionary<string, string> BuildPlaybackHeaders(string baseUrl)
@@ -130,12 +196,21 @@ namespace Emby.InvidiousPlugin
             return p.ToString();
         }
 
-        private static int? GetInt(JsonElement el, string name)
+        public static int? GetInt(JsonElement el, string name)
         {
             if (el.ValueKind != JsonValueKind.Object) return null;
             if (!el.TryGetProperty(name, out var p)) return null;
             if (p.ValueKind == JsonValueKind.Number && p.TryGetInt32(out var i)) return i;
             if (p.ValueKind == JsonValueKind.String && int.TryParse(p.GetString(), out var s)) return s;
+            return null;
+        }
+
+        public static long? GetLong(JsonElement el, string name)
+        {
+            if (el.ValueKind != JsonValueKind.Object) return null;
+            if (!el.TryGetProperty(name, out var p)) return null;
+            if (p.ValueKind == JsonValueKind.Number && p.TryGetInt64(out var i)) return i;
+            if (p.ValueKind == JsonValueKind.String && long.TryParse(p.GetString(), out var s)) return s;
             return null;
         }
     }

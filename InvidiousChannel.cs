@@ -2,6 +2,7 @@
 using MediaBrowser.Controller.Providers;
 using MediaBrowser.Model.Channels;
 using MediaBrowser.Model.Dto;
+using MediaBrowser.Model.Drawing;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.LiveTv;
 using MediaBrowser.Model.MediaInfo;
@@ -19,7 +20,7 @@ namespace Emby.InvidiousPlugin
         public string Name => "Invidious";
         public string Description => "Privacy-friendly YouTube";
         public string Id => "invidious_channel_19";
-        public string DataVersion => "1.0.18";
+        public string DataVersion => "4.0.6"; 
 
         public ChannelType Type => ChannelType.TV;
         public ChannelParentalRating ParentalRating => ChannelParentalRating.GeneralAudience;
@@ -40,67 +41,57 @@ namespace Emby.InvidiousPlugin
             {
                 var api = new InvidiousApi();
 
-                // --- 1. MAIN MENU AUFBAUEN ---
+             
                 if (string.IsNullOrEmpty(query.FolderId))
                 {
-                    items.Add(new ChannelItemInfo { Name = "⭐ Popular", Id = "popular", Type = ChannelItemType.Folder });
+                    var savedItems = (config.SavedItems ?? "").Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
 
-                    var searches = (config.SavedSearches ?? "").Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
-                    foreach (var s in searches)
+                    var menuTasks = savedItems.Select(async s =>
                     {
                         var term = s.Trim();
-                        if (!string.IsNullOrEmpty(term)) items.Add(new ChannelItemInfo { Name = $"🔍 Search: {term}", Id = $"search_x_{term}", Type = ChannelItemType.Folder });
+                        if (string.IsNullOrEmpty(term)) return null;
+
+                        if (term.StartsWith("@"))
+                        {
+                            
+                            var details = await api.GetChannelDetailsAsync(baseUrl, term, true, cancellationToken).ConfigureAwait(false);
+                            var name = string.IsNullOrEmpty(details.name) ? term : details.name;
+                            var cId = string.IsNullOrEmpty(details.id) ? term : details.id;
+
+                            return new ChannelItemInfo { Name = $"📺 {name}", Id = $"channel_x_{cId}", Type = ChannelItemType.Folder, ImageUrl = details.thumb };
+                        }
+                        else if (term.StartsWith("UC") && term.Length > 20)
+                        {
+                            var details = await api.GetChannelDetailsAsync(baseUrl, term, false, cancellationToken).ConfigureAwait(false);
+                            var name = string.IsNullOrEmpty(details.name) ? "Channel" : details.name;
+
+                            return new ChannelItemInfo { Name = $"📺 {name}", Id = $"channel_x_{term}", Type = ChannelItemType.Folder, ImageUrl = details.thumb };
+                        }
+                        else if (term.StartsWith("PL"))
+                        {
+                         
+                            var details = await api.GetPlaylistDetailsAsync(baseUrl, term, cancellationToken).ConfigureAwait(false);
+                            var name = string.IsNullOrEmpty(details.name) ? "Playlist" : details.name;
+
+                            return new ChannelItemInfo { Name = $"🎵 {name}", Id = $"playlist_x_{term}", Type = ChannelItemType.Folder, ImageUrl = details.thumb };
+                        }
+                        else
+                        {
+                            return new ChannelItemInfo { Name = $"🔍 {term}", Id = $"search_x_{term}", Type = ChannelItemType.Folder };
+                        }
+                    });
+
+                    var results = await Task.WhenAll(menuTasks).ConfigureAwait(false);
+                    foreach (var res in results)
+                    {
+                        if (res != null) items.Add(res);
                     }
 
-                    var channels = (config.SavedChannels ?? "").Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
-                    var channelTasks = channels.Select(async c => {
-                        var cId = c.Trim();
-                        if (string.IsNullOrEmpty(cId)) return null;
-                        string displayName = cId;
-                        try
-                        {
-                            using var doc = await api.GetChannelDetailsAsync(baseUrl, cId, cancellationToken).ConfigureAwait(false);
-                            var author = InvidiousApi.GetString(doc.RootElement, "author");
-                            if (!string.IsNullOrEmpty(author)) displayName = author;
-                        }
-                        catch { }
-                        return new ChannelItemInfo { Name = $"📺 Channel: {displayName}", Id = $"channel_x_{cId}", Type = ChannelItemType.Folder };
-                    });
-
-                    var channelResults = await Task.WhenAll(channelTasks).ConfigureAwait(false);
-                    foreach (var res in channelResults) if (res != null) items.Add(res);
-
-                    var playlists = (config.SavedPlaylists ?? "").Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
-                    var playlistTasks = playlists.Select(async p => {
-                        var pId = p.Trim();
-                        if (string.IsNullOrEmpty(pId)) return null;
-                        string displayName = pId;
-                        try
-                        {
-                            using var doc = await api.GetPlaylistDetailsAsync(baseUrl, pId, cancellationToken).ConfigureAwait(false);
-                            var title = InvidiousApi.GetString(doc.RootElement, "title");
-                            if (!string.IsNullOrEmpty(title)) displayName = title;
-                        }
-                        catch { }
-                        return new ChannelItemInfo { Name = $"🎵 Playlist: {displayName}", Id = $"playlist_x_{pId}", Type = ChannelItemType.Folder };
-                    });
-
-                    var playlistResults = await Task.WhenAll(playlistTasks).ConfigureAwait(false);
-                    foreach (var res in playlistResults) if (res != null) items.Add(res);
-
                     return new ChannelItemResult { Items = items, TotalRecordCount = items.Count };
                 }
 
-                // --- 2. POPULAR ---
-                if (query.FolderId == "popular")
-                {
-                    using var doc = await api.GetPopularAsync(baseUrl, cancellationToken).ConfigureAwait(false);
-                    items.AddRange(ExtractVideos(doc));
-                    return new ChannelItemResult { Items = items, TotalRecordCount = items.Count };
-                }
-
-                // --- 3. PAGINATED CONTENT (100 Videos Limit) ---
-                if (query.FolderId.StartsWith("search_") || query.FolderId.StartsWith("channel_") || query.FolderId.StartsWith("playlist_"))
+           
+                if (query.FolderId.Contains("_x_"))
                 {
                     var parts = query.FolderId.Split(new[] { '_' }, 3);
                     if (parts.Length < 3) return new ChannelItemResult { Items = items, TotalRecordCount = 0 };
@@ -109,7 +100,10 @@ namespace Emby.InvidiousPlugin
                     string term = parts[2];
 
                     int startIndex = query.StartIndex ?? 0;
-                    int limit = 100;
+
+                    int limit = type == "search" ? config.MaxSearchVideos : config.MaxChannelVideos;
+                    if (limit <= 0) limit = 50;
+                    if (limit > 150) limit = 150;
 
                     int startPage = (startIndex / 20) + 1;
                     int skipItems = startIndex % 20;
@@ -119,7 +113,7 @@ namespace Emby.InvidiousPlugin
 
                     while (items.Count < limit)
                     {
-                        JsonDocument doc = null;
+                        JsonDocument? doc = null;
                         if (type == "search") doc = await api.SearchVideosAsync(baseUrl, term, currentPage, cancellationToken).ConfigureAwait(false);
                         else if (type == "channel") doc = await api.GetChannelVideosAsync(baseUrl, term, currentPage, cancellationToken).ConfigureAwait(false);
                         else if (type == "playlist") doc = await api.GetPlaylistVideosAsync(baseUrl, term, currentPage, cancellationToken).ConfigureAwait(false);
@@ -131,6 +125,7 @@ namespace Emby.InvidiousPlugin
 
                         if (tempItems.Count == 0) break;
 
+                        var itemsToProcess = new List<ChannelItemInfo>();
                         foreach (var item in tempItems)
                         {
                             if (skipItems > 0)
@@ -140,9 +135,63 @@ namespace Emby.InvidiousPlugin
                             }
                             if (seenIds.Add(item.Id))
                             {
-                                items.Add(item);
+                                itemsToProcess.Add(item);
                             }
-                            if (items.Count >= limit) break;
+                            if (items.Count + itemsToProcess.Count >= limit) break;
+                        }
+
+                        var semaphore = new SemaphoreSlim(20);
+                        var detailTasks = itemsToProcess.Select(async item =>
+                        {
+                            await semaphore.WaitAsync();
+                            try
+                            {
+                                var vId = item.Id.Replace("video:", "");
+                                using var vDoc = await api.GetVideoAsync(baseUrl, vId, cancellationToken).ConfigureAwait(false);
+                                var root = vDoc.RootElement;
+
+                                var fullDesc = InvidiousApi.GetString(root, "description");
+                                if (!string.IsNullOrWhiteSpace(fullDesc))
+                                {
+                                    var viewCount = InvidiousApi.GetLong(root, "viewCount");
+                                    string overviewText = "";
+                                    if (viewCount.HasValue && viewCount.Value > 0)
+                                    {
+                                        overviewText += $"👁 {viewCount.Value:N0} Aufrufe\n\n";
+                                    }
+                                    overviewText += fullDesc;
+                                    item.Overview = overviewText;
+                                }
+
+                                var truePublishedUnix = InvidiousApi.GetLong(root, "published");
+                                if (truePublishedUnix.HasValue)
+                                {
+                                    var trueDate = DateTimeOffset.FromUnixTimeSeconds(truePublishedUnix.Value).UtcDateTime;
+                                    item.PremiereDate = trueDate;
+                                    item.DateCreated = trueDate;
+                                    item.ProductionYear = trueDate.Year;
+                                }
+
+                                var lengthSeconds = InvidiousApi.GetInt(root, "lengthSeconds");
+                                if (lengthSeconds.HasValue && lengthSeconds.Value > 0)
+                                {
+                                    item.RunTimeTicks = TimeSpan.FromSeconds(lengthSeconds.Value).Ticks;
+                                }
+                            }
+                            catch { }
+                            finally
+                            {
+                                semaphore.Release();
+                            }
+                        });
+
+                        await Task.WhenAll(detailTasks).ConfigureAwait(false);
+
+                        foreach (var item in itemsToProcess)
+                        {
+                            int currentIndex = startIndex + items.Count + 1;
+                            item.Name = $"{currentIndex:D3} | {item.Name}";
+                            items.Add(item);
                         }
 
                         if (tempItems.Count < 10) break;
@@ -183,11 +232,6 @@ namespace Emby.InvidiousPlugin
                     videoArray = v;
                     foundArray = true;
                 }
-                else if (doc.RootElement.TryGetProperty("latestVideos", out var lv) && lv.ValueKind == JsonValueKind.Array)
-                {
-                    videoArray = lv;
-                    foundArray = true;
-                }
             }
 
             if (!foundArray) return list;
@@ -196,26 +240,52 @@ namespace Emby.InvidiousPlugin
             {
                 var title = InvidiousApi.GetString(el, "title") ?? "Untitled";
                 var videoId = InvidiousApi.GetString(el, "videoId");
-                var author = InvidiousApi.GetString(el, "author");
-
-                var description = InvidiousApi.GetString(el, "description") ?? InvidiousApi.GetString(el, "descriptionHtml") ?? "";
+                var author = InvidiousApi.GetString(el, "author") ?? "Unknown Channel";
 
                 if (string.IsNullOrWhiteSpace(videoId)) continue;
                 string thumbUrl = $"https://img.youtube.com/vi/{videoId}/hqdefault.jpg";
 
-                string overviewText = $"📺 Channel: {author}";
-                if (!string.IsNullOrWhiteSpace(description))
+                var rawDescription = InvidiousApi.GetString(el, "description") ?? "";
+                var viewCount = InvidiousApi.GetLong(el, "viewCount");
+                string overviewText = "";
+                if (viewCount.HasValue && viewCount.Value > 0)
                 {
-                    overviewText += $"\n\n{description}";
+                    overviewText += $"👁 {viewCount.Value:N0} Aufrufe\n\n";
+                }
+                overviewText += rawDescription;
+
+                var publishedUnix = InvidiousApi.GetLong(el, "published");
+                DateTime? premiereDate = null;
+                int? productionYear = null;
+                if (publishedUnix.HasValue)
+                {
+                    premiereDate = DateTimeOffset.FromUnixTimeSeconds(publishedUnix.Value).UtcDateTime;
+                    productionYear = premiereDate.Value.Year;
+                }
+
+                var lengthSeconds = InvidiousApi.GetInt(el, "lengthSeconds");
+                long? runTimeTicks = null;
+                if (lengthSeconds.HasValue && lengthSeconds.Value > 0)
+                {
+                    runTimeTicks = TimeSpan.FromSeconds(lengthSeconds.Value).Ticks;
                 }
 
                 list.Add(new ChannelItemInfo
                 {
                     Name = title,
-                    Id = "video:" + videoId,
+                    SeriesName = author,
+                    Studios = new List<string> { author },
+                    ProductionYear = productionYear,
+                    Overview = overviewText,
+                    DateCreated = premiereDate,
+                    PremiereDate = premiereDate,
+                    RunTimeTicks = runTimeTicks,
+
+                    ContentType = ChannelMediaContentType.Episode,
+
+                    Id = videoId,
                     Type = ChannelItemType.Media,
                     MediaType = ChannelMediaType.Video,
-                    Overview = overviewText,
                     ImageUrl = thumbUrl
                 });
             }
@@ -224,18 +294,23 @@ namespace Emby.InvidiousPlugin
 
         public async Task<IEnumerable<MediaSourceInfo>> GetChannelItemMediaInfo(string id, CancellationToken cancellationToken)
         {
-            var videoId = id.Replace("video:", "");
+            var videoId = id;
             var config = Plugin.Instance!.Options;
-            var baseUrl = (config.InvidiousUrl ?? "").TrimEnd('/');
+            var baseUrl = (config.InvidiousUrl ?? "https://yewtu.be").TrimEnd('/');
 
             var api = new InvidiousApi();
+            var headers = InvidiousApi.BuildPlaybackHeaders(baseUrl);
             var playUrl = $"{baseUrl}/latest_version?id={videoId}&itag=22";
 
             try
             {
                 using var videoDoc = await api.GetVideoAsync(baseUrl, videoId, cancellationToken).ConfigureAwait(false);
-                var streamUrl = api.SelectBestStreamUrl(videoDoc);
-                if (!string.IsNullOrWhiteSpace(streamUrl)) playUrl = streamUrl;
+                var streams = api.ExtractAllStreams(baseUrl, videoDoc);
+
+                if (!string.IsNullOrWhiteSpace(streams.mp4))
+                {
+                    playUrl = streams.mp4;
+                }
             }
             catch { }
 
@@ -243,22 +318,35 @@ namespace Emby.InvidiousPlugin
             {
                 new MediaSourceInfo
                 {
-                    // DER FIX GEGEN DEN HÄSSLICHEN LINK:
-                    // Wir geben als "Name" des Streams einfach einen sauberen Text an. 
-                    // Dadurch druckt Emby diesen sauberen Text unten bei "Media Info" hin statt der endlosen URL!
-                    Name = "Invidious Stream (MP4)",
+                    Id = videoId,
+                    Name = "Invidious Direct (MP4)",
                     Path = playUrl,
                     Protocol = MediaProtocol.Http,
-                    Id = "src:" + videoId,
                     IsInfiniteStream = false,
-                    Container = "mp4", // Das hilft Emby zusätzlich, es ordentlich darzustellen
-                    RequiredHttpHeaders = InvidiousApi.BuildPlaybackHeaders(baseUrl)
+                    Container = "mp4",
+                    RequiredHttpHeaders = headers
                 }
             };
         }
 
         public IEnumerable<ImageType> GetSupportedChannelImages() => new List<ImageType> { ImageType.Thumb, ImageType.Primary };
-        public Task<DynamicImageResponse> GetChannelImage(ImageType type, CancellationToken cancellationToken) => Task.FromResult<DynamicImageResponse>(null!);
+
+        public Task<DynamicImageResponse> GetChannelImage(ImageType type, CancellationToken cancellationToken)
+        {
+            var typeName = GetType();
+            var stream = typeName.Assembly.GetManifestResourceStream(typeName.Namespace + ".thumb.png");
+
+            if (stream == null)
+            {
+                return Task.FromResult<DynamicImageResponse>(null!);
+            }
+
+            return Task.FromResult(new DynamicImageResponse
+            {
+                Format = ImageFormat.Png,
+                Stream = stream
+            });
+        }
 
         private static ChannelItemResult Msg(List<ChannelItemInfo> items, string msg)
         {
