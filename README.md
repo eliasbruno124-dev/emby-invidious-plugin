@@ -1,4 +1,4 @@
-# 📺 Emby Invidious Plugin (Self-Hosted Edition)
+# 📺 Emby Invidious Plugin
 
 A powerful, privacy-friendly [Invidious](https://github.com/iv-org/invidious/) plugin for [Emby](https://emby.media/) that operates entirely without Google API keys. It uses an Invidious instance (ideally self-hosted) to seamlessly integrate channels, playlists, and search queries directly into your Emby dashboard.
 
@@ -10,6 +10,7 @@ Plugin Screenshot <img width="1918" height="867" alt="main site" src="https://gi
 * **🔄 Seamless Playlist Syncing:** Log into your Invidious account and create a **public playlist**. Add its `PL...` ID to this plugin. Any video you add to that playlist via Invidious will automatically sync to your Emby dashboard!
 * **🎯 Smart "@" Input:** A single, clean text field for all your content! Type `@GitHub` for channels, `PL123...` for playlists, or regular words for search queries.
 * **🖼️ Real Profile Pictures:** The plugin automatically fetches high-resolution channel avatars and playlist covers for the main menu.
+* **⏯️ "Continue Watching" Support:** Videos are internally declared as episodes. Emby perfectly remembers your exact progress (green progress bar) and displays unfinished videos on your home screen.
 * **🚀 Direct MP4 Playback:** Silently extracts the pure MP4 stream in the background. This guarantees instant, error-free playback on *any* Smart TV, smartphone, or browser.
 
 ---
