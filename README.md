@@ -1,11 +1,8 @@
 # 📺 Emby Invidious Plugin (Self-Hosted Edition)
 
-Plugin Screenshot <img width="1918" height="867" alt="main site" src="https://github.com/user-attachments/assets/a9bc0d27-f65f-4f8f-b06a-cf026e86c074" /><img width="1918" height="875" alt="overview" src="https://github.com/user-attachments/assets/5c03fd67-263f-48ed-b26d-794fa84c20d5" /><img width="1918" height="867" alt="channel" src="https://github.com/user-attachments/assets/85dc2686-13b6-4efe-9e4f-cc3bd9e24370" />
-
-
-
-
 A powerful, privacy-friendly [Invidious](https://github.com/iv-org/invidious/) plugin for [Emby](https://emby.media/) that operates entirely without Google API keys. It uses an Invidious instance (ideally self-hosted) to seamlessly integrate channels, playlists, and search queries directly into your Emby dashboard.
+
+Plugin Screenshot <img width="1918" height="867" alt="main site" src="https://github.com/user-attachments/assets/a9bc0d27-f65f-4f8f-b06a-cf026e86c074" /><img width="1918" height="875" alt="overview" src="https://github.com/user-attachments/assets/5c03fd67-263f-48ed-b26d-794fa84c20d5" /><img width="1918" height="867" alt="channel" src="https://github.com/user-attachments/assets/85dc2686-13b6-4efe-9e4f-cc3bd9e24370" />
 
 ## ✨ Features
 
