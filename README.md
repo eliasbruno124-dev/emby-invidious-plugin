@@ -10,12 +10,9 @@ A powerful, privacy-friendly YouTube plugin for [Emby](https://emby.media/) that
 ## ✨ Features
 
 * **🛡️ 100% Privacy:** No Google trackers, no API keys required. Everything runs locally through your Invidious instance.
-* **🔄 Seamless Playlist Syncing:** Log into your Invidious account and create a **public playlist**. Add its `PL...` ID to this plugin. Any video you add to that playlist via Invidious will now automatically sync to your Emby dashboard!
+* **🔄 Seamless Playlist Syncing:** Log into your Invidious account and create a **public playlist**. Add its `PL...` ID to this plugin. Any video you add to that playlist via Invidious will automatically sync to your Emby dashboard!
 * **🎯 Smart "@" Input:** A single, clean text field for all your content! Type `@GitHub` for channels, `PL123...` for playlists, or regular words for search queries.
 * **🖼️ Real Profile Pictures:** The plugin automatically fetches high-resolution channel avatars and playlist covers for the main menu.
-* **📝 Uncut Descriptions:** Bypasses the standard Invidious limits to asynchronously load complete video descriptions, including proper line breaks and view counts.
-* **📅 Accurate Dates:** Extracts the exact, true upload date, bypassing the Invidious "playlist-added-date" bug.
-* **⏯️ "Continue Watching" Support:** Videos are internally declared as episodes. Emby perfectly remembers your exact progress (green progress bar) and displays unfinished videos on your home screen.
 * **🚀 Direct MP4 Playback:** Silently extracts the pure MP4 stream in the background. This guarantees instant, error-free playback on *any* Smart TV, smartphone, or browser.
 
 ---
@@ -67,7 +64,6 @@ To fetch new videos from your saved channels and playlists, Emby uses an automat
 4. Build the project as a Class Library.
 
 ## 💖 Donate
-If you find this plugin useful and want to support its development, feel free to leave a tip. Thank you! 💙
 
 [![PayPal](https://img.shields.io/badge/PayPal-00457C?style=for-the-badge&logo=paypal&logoColor=white)](https://paypal.me/eliasbruno123)
 
