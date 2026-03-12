@@ -11,7 +11,10 @@ namespace Emby.InvidiousPlugin
 {
     public class InvidiousApi
     {
-        private static readonly HttpClient Http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false });
+        private static readonly HttpClient Http = new HttpClient(new HttpClientHandler
+        {
+            AllowAutoRedirect = false
+        });
 
         private static Uri BaseUri(string baseUrl) => new Uri((baseUrl ?? "").TrimEnd('/') + "/");
 
@@ -30,6 +33,7 @@ namespace Emby.InvidiousPlugin
 
             var req = new HttpRequestMessage(HttpMethod.Get, url);
             req.Headers.TryAddWithoutValidation("Accept", "application/json");
+
             if (!string.IsNullOrWhiteSpace(auth))
                 req.Headers.TryAddWithoutValidation("Authorization", auth);
 
@@ -41,11 +45,11 @@ namespace Emby.InvidiousPlugin
             using var req = CreateGet(baseUrl, relative);
             using var resp = await Http.SendAsync(req, ct).ConfigureAwait(false);
             resp.EnsureSuccessStatusCode();
+
             await using var s = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
             return await JsonDocument.ParseAsync(s, cancellationToken: ct).ConfigureAwait(false);
         }
 
-        
         public async Task<(string? id, string? name, string? thumb)> GetChannelDetailsAsync(string baseUrl, string query, bool isHandle, CancellationToken ct)
         {
             try
@@ -74,11 +78,13 @@ namespace Emby.InvidiousPlugin
                     return (id, author, thumb);
                 }
             }
-            catch { }
+            catch
+            {
+            }
+
             return (null, null, null);
         }
 
-        
         public async Task<(string? name, string? thumb)> GetPlaylistDetailsAsync(string baseUrl, string id, CancellationToken ct)
         {
             try
@@ -90,17 +96,20 @@ namespace Emby.InvidiousPlugin
                 var thumb = GetHighestResThumb(root, "playlistThumbnails");
                 return (title, thumb);
             }
-            catch { }
+            catch
+            {
+            }
+
             return (null, null);
         }
 
-        
         private static string? GetHighestResThumb(JsonElement el, string propertyName)
         {
             if (el.TryGetProperty(propertyName, out var arr) && arr.ValueKind == JsonValueKind.Array)
             {
                 string? bestUrl = null;
                 int bestWidth = 0;
+
                 foreach (var thumb in arr.EnumerateArray())
                 {
                     var url = GetString(thumb, "url");
@@ -114,8 +123,10 @@ namespace Emby.InvidiousPlugin
                         bestUrl = url;
                     }
                 }
+
                 return bestUrl;
             }
+
             return null;
         }
 
@@ -184,7 +195,10 @@ namespace Emby.InvidiousPlugin
             var headers = new Dictionary<string, string>();
             var baseUri = BaseUri(baseUrl);
             var auth = BuildAuthorizationFromUserInfo(baseUri);
-            if (!string.IsNullOrWhiteSpace(auth)) headers["Authorization"] = auth!;
+
+            if (!string.IsNullOrWhiteSpace(auth))
+                headers["Authorization"] = auth!;
+
             return headers;
         }
 
@@ -200,8 +214,10 @@ namespace Emby.InvidiousPlugin
         {
             if (el.ValueKind != JsonValueKind.Object) return null;
             if (!el.TryGetProperty(name, out var p)) return null;
+
             if (p.ValueKind == JsonValueKind.Number && p.TryGetInt32(out var i)) return i;
             if (p.ValueKind == JsonValueKind.String && int.TryParse(p.GetString(), out var s)) return s;
+
             return null;
         }
 
@@ -209,8 +225,10 @@ namespace Emby.InvidiousPlugin
         {
             if (el.ValueKind != JsonValueKind.Object) return null;
             if (!el.TryGetProperty(name, out var p)) return null;
+
             if (p.ValueKind == JsonValueKind.Number && p.TryGetInt64(out var i)) return i;
             if (p.ValueKind == JsonValueKind.String && long.TryParse(p.GetString(), out var s)) return s;
+
             return null;
         }
     }
