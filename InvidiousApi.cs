@@ -45,7 +45,6 @@ namespace Emby.InvidiousPlugin
             return await JsonDocument.ParseAsync(s, cancellationToken: ct).ConfigureAwait(false);
         }
 
-        
         public async Task<(string? id, string? name, string? thumb)> GetChannelDetailsAsync(string baseUrl, string query, bool isHandle, CancellationToken ct)
         {
             try
@@ -78,7 +77,6 @@ namespace Emby.InvidiousPlugin
             return (null, null, null);
         }
 
-        
         public async Task<(string? name, string? thumb)> GetPlaylistDetailsAsync(string baseUrl, string id, CancellationToken ct)
         {
             try
@@ -94,7 +92,6 @@ namespace Emby.InvidiousPlugin
             return (null, null);
         }
 
-        
         private static string? GetHighestResThumb(JsonElement el, string propertyName)
         {
             if (el.TryGetProperty(propertyName, out var arr) && arr.ValueKind == JsonValueKind.Array)
@@ -141,42 +138,6 @@ namespace Emby.InvidiousPlugin
         {
             var id = Uri.EscapeDataString(videoId ?? "");
             return GetJsonAsync(baseUrl, $"api/v1/videos/{id}", ct);
-        }
-
-        public (string? mp4, string? dash, string? hls) ExtractAllStreams(string baseUrl, JsonDocument videoDoc)
-        {
-            var root = videoDoc.RootElement;
-
-            string? dashUrl = GetString(root, "dashUrl");
-            if (!string.IsNullOrEmpty(dashUrl) && dashUrl.StartsWith("/")) dashUrl = baseUrl + dashUrl;
-
-            string? hlsUrl = GetString(root, "hlsUrl");
-            if (!string.IsNullOrEmpty(hlsUrl) && hlsUrl.StartsWith("/")) hlsUrl = baseUrl + hlsUrl;
-
-            var candidates = new List<(string url, int bitrate, string container)>();
-
-            if (root.TryGetProperty("formatStreams", out var arr) && arr.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var el in arr.EnumerateArray())
-                {
-                    var url = GetString(el, "url");
-                    if (string.IsNullOrWhiteSpace(url)) continue;
-                    var bitrate = GetInt(el, "bitrate") ?? 0;
-                    var container = GetString(el, "container") ?? "";
-                    candidates.Add((url!, bitrate, container));
-                }
-            }
-
-            string? mp4Url = null;
-            if (candidates.Count > 0)
-            {
-                mp4Url = candidates
-                    .Where(c => c.container.ToLowerInvariant().Contains("mp4"))
-                    .OrderByDescending(c => c.bitrate)
-                    .FirstOrDefault().url ?? candidates.OrderByDescending(c => c.bitrate).First().url;
-            }
-
-            return (mp4Url, dashUrl, hlsUrl);
         }
 
         public static Dictionary<string, string> BuildPlaybackHeaders(string baseUrl)

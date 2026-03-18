@@ -20,7 +20,7 @@ namespace Emby.InvidiousPlugin
         public string Name => "Invidious";
         public string Description => "Privacy-friendly YouTube";
         public string Id => "invidious_channel_19";
-        public string DataVersion => "4.0.6"; 
+        public string DataVersion => "4.0.37"; // Neue Version für Caches
 
         public ChannelType Type => ChannelType.TV;
         public ChannelParentalRating ParentalRating => ChannelParentalRating.GeneralAudience;
@@ -41,7 +41,6 @@ namespace Emby.InvidiousPlugin
             {
                 var api = new InvidiousApi();
 
-             
                 if (string.IsNullOrEmpty(query.FolderId))
                 {
                     var savedItems = (config.SavedItems ?? "").Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
@@ -53,7 +52,6 @@ namespace Emby.InvidiousPlugin
 
                         if (term.StartsWith("@"))
                         {
-                            
                             var details = await api.GetChannelDetailsAsync(baseUrl, term, true, cancellationToken).ConfigureAwait(false);
                             var name = string.IsNullOrEmpty(details.name) ? term : details.name;
                             var cId = string.IsNullOrEmpty(details.id) ? term : details.id;
@@ -69,7 +67,6 @@ namespace Emby.InvidiousPlugin
                         }
                         else if (term.StartsWith("PL"))
                         {
-                         
                             var details = await api.GetPlaylistDetailsAsync(baseUrl, term, cancellationToken).ConfigureAwait(false);
                             var name = string.IsNullOrEmpty(details.name) ? "Playlist" : details.name;
 
@@ -90,7 +87,6 @@ namespace Emby.InvidiousPlugin
                     return new ChannelItemResult { Items = items, TotalRecordCount = items.Count };
                 }
 
-           
                 if (query.FolderId.Contains("_x_"))
                 {
                     var parts = query.FolderId.Split(new[] { '_' }, 3);
@@ -294,39 +290,58 @@ namespace Emby.InvidiousPlugin
 
         public async Task<IEnumerable<MediaSourceInfo>> GetChannelItemMediaInfo(string id, CancellationToken cancellationToken)
         {
-            var videoId = id;
             var config = Plugin.Instance!.Options;
             var baseUrl = (config.InvidiousUrl ?? "https://yewtu.be").TrimEnd('/');
-
-            var api = new InvidiousApi();
             var headers = InvidiousApi.BuildPlaybackHeaders(baseUrl);
-            var playUrl = $"{baseUrl}/latest_version?id={videoId}&itag=22";
+
+            string bestItag = "22"; // 720p MP4 Fallback (Default)
 
             try
             {
-                using var videoDoc = await api.GetVideoAsync(baseUrl, videoId, cancellationToken).ConfigureAwait(false);
-                var streams = api.ExtractAllStreams(baseUrl, videoDoc);
+                var api = new InvidiousApi();
+                using var videoDoc = await api.GetVideoAsync(baseUrl, id, cancellationToken).ConfigureAwait(false);
+                var root = videoDoc.RootElement;
 
-                if (!string.IsNullOrWhiteSpace(streams.mp4))
+                // Wir suchen dynamisch nach der besten Auflösung, falls 720p nicht existiert
+                if (root.TryGetProperty("formatStreams", out var arr) && arr.ValueKind == JsonValueKind.Array)
                 {
-                    playUrl = streams.mp4;
+                    var bestStream = arr.EnumerateArray()
+                        .Where(el => InvidiousApi.GetString(el, "container")?.ToLowerInvariant().Contains("mp4") == true)
+                        .OrderByDescending(el => InvidiousApi.GetInt(el, "bitrate") ?? 0)
+                        .FirstOrDefault();
+
+                    var foundItag = InvidiousApi.GetString(bestStream, "itag");
+                    if (!string.IsNullOrEmpty(foundItag))
+                    {
+                        bestItag = foundItag;
+                    }
                 }
             }
             catch { }
 
-            return new List<MediaSourceInfo>
+            string playUrl = $"{baseUrl}/latest_version?id={id}&itag={bestItag}&local=true";
+
+            var sources = new List<MediaSourceInfo>
             {
                 new MediaSourceInfo
                 {
-                    Id = videoId,
-                    Name = "Invidious Direct (MP4)",
+                    Id = id,
+                    Name = $"Invidious MP4 (Proxy itag:{bestItag})",
                     Path = playUrl,
                     Protocol = MediaProtocol.Http,
                     IsInfiniteStream = false,
                     Container = "mp4",
-                    RequiredHttpHeaders = headers
+                    IsRemote = true,
+                    RequiredHttpHeaders = headers,
+                    
+                    // WICHTIGSTER FIX: Blockiert DirectPlay, damit Emby proxied!
+                    SupportsDirectPlay = false,
+                    SupportsDirectStream = true,
+                    SupportsTranscoding = true
                 }
             };
+
+            return sources;
         }
 
         public IEnumerable<ImageType> GetSupportedChannelImages() => new List<ImageType> { ImageType.Thumb, ImageType.Primary };
