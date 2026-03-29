@@ -20,8 +20,9 @@ namespace Emby.InvidiousPlugin
     {
         public string Name => "Invidious";
         public string Description => "Privacy-friendly YouTube";
-        public string Id => "invidious_channel_20";
-        public string DataVersion => "6.0.0";
+        public string Id => "invidious_channel_19";
+        public string DataVersion => "4.0.6"; 
+
         public ChannelType Type => ChannelType.TV;
         public ChannelParentalRating ParentalRating => ChannelParentalRating.GeneralAudience;
         public bool IsEnabledByDefault => true;
@@ -42,7 +43,7 @@ namespace Emby.InvidiousPlugin
             {
                 var api = new InvidiousApi();
 
-                // ── Root: show saved items as folders ──
+             
                 if (string.IsNullOrEmpty(query.FolderId))
                 {
                     var savedItems = (config.SavedItems ?? "").Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
@@ -52,8 +53,12 @@ namespace Emby.InvidiousPlugin
                         if (string.IsNullOrEmpty(term)) return null;
                         if (term.StartsWith("@"))
                         {
-                            var d = await api.GetChannelDetailsAsync(baseUrl, term, true, cancellationToken).ConfigureAwait(false);
-                            return new ChannelItemInfo { Name = $"📺 {d.name ?? term}", Id = $"channel_x_{d.id ?? term}", Type = ChannelItemType.Folder, ImageUrl = d.thumb };
+                            
+                            var details = await api.GetChannelDetailsAsync(baseUrl, term, true, cancellationToken).ConfigureAwait(false);
+                            var name = string.IsNullOrEmpty(details.name) ? term : details.name;
+                            var cId = string.IsNullOrEmpty(details.id) ? term : details.id;
+
+                            return new ChannelItemInfo { Name = $"📺 {name}", Id = $"channel_x_{cId}", Type = ChannelItemType.Folder, ImageUrl = details.thumb };
                         }
                         if (term.StartsWith("UC") && term.Length > 20)
                         {
@@ -62,8 +67,11 @@ namespace Emby.InvidiousPlugin
                         }
                         if (term.StartsWith("PL"))
                         {
-                            var d = await api.GetPlaylistDetailsAsync(baseUrl, term, cancellationToken).ConfigureAwait(false);
-                            return new ChannelItemInfo { Name = $"🎵 {d.name ?? "Playlist"}", Id = $"playlist_x_{term}", Type = ChannelItemType.Folder, ImageUrl = d.thumb };
+                         
+                            var details = await api.GetPlaylistDetailsAsync(baseUrl, term, cancellationToken).ConfigureAwait(false);
+                            var name = string.IsNullOrEmpty(details.name) ? "Playlist" : details.name;
+
+                            return new ChannelItemInfo { Name = $"🎵 {name}", Id = $"playlist_x_{term}", Type = ChannelItemType.Folder, ImageUrl = details.thumb };
                         }
                         return new ChannelItemInfo { Name = $"🔍 {term}", Id = $"search_x_{term}", Type = ChannelItemType.Folder };
                     });
@@ -72,7 +80,7 @@ namespace Emby.InvidiousPlugin
                     return new ChannelItemResult { Items = items, TotalRecordCount = items.Count };
                 }
 
-                // ── Sub-folder: load videos ──
+           
                 if (query.FolderId.Contains("_x_"))
                 {
                     var parts = query.FolderId.Split(new[] { '_' }, 3);
@@ -271,133 +279,41 @@ namespace Emby.InvidiousPlugin
                     }
                 }
 
-                // ── 1080p+ via FFmpeg HLS mux ──
-                if (bestVideoItag != null && bestAudioItag != null && bestVideoHeight > fallbackHeight)
-                {
-                    // Strategy:
-                    //   1. Try direct CDN URLs (fast, works when IPs match e.g. Windows)
-                    //   2. Fallback: Invidious proxy URLs (always works, no auth needed on internal network)
-                    string ffmpegVideoUrl, ffmpegAudioUrl;
-                    if (!string.IsNullOrEmpty(bestVideoUrl) && !string.IsNullOrEmpty(bestAudioUrl))
-                    {
-                        ffmpegVideoUrl = bestVideoUrl;
-                        ffmpegAudioUrl = bestAudioUrl;
-                    }
-                    else
-                    {
-                        var cleanBase = InvidiousApi.GetCleanBaseUrl(baseUrl);
-                        ffmpegVideoUrl = $"{cleanBase}/latest_version?id={id}&itag={bestVideoItag}&local=true";
-                        ffmpegAudioUrl = $"{cleanBase}/latest_version?id={id}&itag={bestAudioItag}&local=true";
-                    }
-
-                    var m3u8Path = await MuxHelper.MuxToHlsAsync(
-                        ffmpegVideoUrl, ffmpegAudioUrl, id, bestVideoHeight
-                    ).ConfigureAwait(false);
-
-                    // If CDN URLs failed, retry with Invidious proxy
-                    if (string.IsNullOrEmpty(m3u8Path) && !string.IsNullOrEmpty(bestVideoUrl))
-                    {
-                        var cleanBase = InvidiousApi.GetCleanBaseUrl(baseUrl);
-                        ffmpegVideoUrl = $"{cleanBase}/latest_version?id={id}&itag={bestVideoItag}&local=true";
-                        ffmpegAudioUrl = $"{cleanBase}/latest_version?id={id}&itag={bestAudioItag}&local=true";
-                        m3u8Path = await MuxHelper.MuxToHlsAsync(
-                            ffmpegVideoUrl, ffmpegAudioUrl, id, bestVideoHeight
-                        ).ConfigureAwait(false);
-                    }
-
-                    if (!string.IsNullOrEmpty(m3u8Path) && File.Exists(m3u8Path))
-                    {
-                        sources.Add(new MediaSourceInfo
-                        {
-                            Id = $"{id}_hls_{bestVideoHeight}p",
-                            Name = $"🎬 {bestVideoLabel ?? $"{bestVideoHeight}p"} (HD)",
-                            Path = m3u8Path,
-                            Protocol = MediaProtocol.File,
-                            Container = "hls",
-                            IsRemote = false,
-                            SupportsDirectPlay = false,
-                            SupportsDirectStream = true,
-                            SupportsTranscoding = true,
-                            DefaultAudioStreamIndex = 1,
-                            MediaStreams = new List<MediaStream>
-                            {
-                                new MediaStream
-                                {
-                                    Type = MediaStreamType.Video,
-                                    Index = 0,
-                                    Codec = "h264",
-                                    Width = bestVideoHeight == 1080 ? 1920 : bestVideoHeight == 720 ? 1280 : bestVideoHeight == 1440 ? 2560 : 1920,
-                                    Height = bestVideoHeight,
-                                    IsDefault = true
-                                },
-                                new MediaStream
-                                {
-                                    Type = MediaStreamType.Audio,
-                                    Index = 1,
-                                    Codec = "aac",
-                                    Channels = 2,
-                                    SampleRate = 44100,
-                                    IsDefault = true
-                                }
-                            }
-                        });
-                    }
-                }
-
-                // ── Fallback: direct muxed stream from Invidious ──
-                string fbLabel = fallbackHeight > 0 ? $"{fallbackHeight}p" : "SD";
-                sources.Add(new MediaSourceInfo
-                {
-                    Id = $"{id}_direct_{fbLabel}",
-                    Name = $"📺 {fbLabel} MP4 (Direct)",
-                    Path = $"{baseUrl}/latest_version?id={id}&itag={fallbackItag}&local=true",
-                    Protocol = MediaProtocol.Http,
-                    Container = "mp4",
-                    IsRemote = true,
-                    RequiredHttpHeaders = headers,
-                    SupportsDirectPlay = false,
-                    SupportsDirectStream = true,
-                    SupportsTranscoding = true,
-                });
-            }
-            catch
-            {
-                sources.Add(new MediaSourceInfo
-                {
-                    Id = id,
-                    Name = "Invidious (Fallback)",
-                    Path = $"{baseUrl}/latest_version?id={id}&itag=18&local=true",
-                    Protocol = MediaProtocol.Http,
-                    Container = "mp4",
-                    IsRemote = true,
-                    RequiredHttpHeaders = headers,
-                    SupportsDirectPlay = false,
-                    SupportsDirectStream = true,
-                    SupportsTranscoding = true,
-                });
-            }
-
-            return sources;
-        }
-
-        // ═══════════════════════════════════════════════════════════
-        // HELPERS
-        // ═══════════════════════════════════════════════════════════
-
-        /// <summary>
-        /// Parses video height from Invidious JSON element.
-        /// Tries: "size" ("1920x1080") → "resolution" ("1080p") → "qualityLabel" ("1080p60")
-        /// </summary>
-        private static int ParseHeightFromElement(JsonElement el)
+        public async Task<IEnumerable<MediaSourceInfo>> GetChannelItemMediaInfo(string id, CancellationToken cancellationToken)
         {
-            // Try "size": "1920x1080"
-            var size = InvidiousApi.GetString(el, "size");
-            if (!string.IsNullOrEmpty(size))
+            var videoId = id;
+            var config = Plugin.Instance!.Options;
+            var baseUrl = (config.InvidiousUrl ?? "https://yewtu.be").TrimEnd('/');
+
+            var api = new InvidiousApi();
+            var headers = InvidiousApi.BuildPlaybackHeaders(baseUrl);
+            var playUrl = $"{baseUrl}/latest_version?id={videoId}&itag=22";
+
+            try
             {
-                var idx = size.IndexOf('x');
-                if (idx > 0 && int.TryParse(size.Substring(idx + 1), out var h))
-                    return h;
+                using var videoDoc = await api.GetVideoAsync(baseUrl, videoId, cancellationToken).ConfigureAwait(false);
+                var streams = api.ExtractAllStreams(baseUrl, videoDoc);
+
+                if (!string.IsNullOrWhiteSpace(streams.mp4))
+                {
+                    playUrl = streams.mp4;
+                }
             }
+            catch { }
+
+            return new List<MediaSourceInfo>
+            {
+                sources.Add(new MediaSourceInfo
+                {
+                    Id = videoId,
+                    Name = "Invidious Direct (MP4)",
+                    Path = playUrl,
+                    Protocol = MediaProtocol.Http,
+                    Container = "mp4",
+                    RequiredHttpHeaders = headers
+                }
+            };
+        }
 
             // Try "resolution": "1080p"
             var res = InvidiousApi.GetString(el, "resolution");
