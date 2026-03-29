@@ -1,32 +1,26 @@
-﻿using Emby.Web.GenericEdit;
+using Emby.Web.GenericEdit;
 using System.ComponentModel;
 
 namespace Emby.InvidiousPlugin
 {
     public class PluginConfiguration : EditableOptionsBase
     {
-        public override string EditorTitle => "Invidious Settings";
+        public override string EditorTitle => "Invidious Plugin Settings";
 
         [DisplayName("My Invidious Instance URL")]
-        [Description("Enter the URL of your self-hosted instance (e.g. http://localhost:3000)")]
-        public string InvidiousUrl { get; set; } = "http://localhost:3000";
+        [Description("Enter the URL of your self-hosted Invidious instance (e.g. http://localhost:3000). For Basic Auth use: https://User:Password@invidious.example.com")]
+        public string InvidiousUrl { get; set; } = "";
 
-        [DisplayName("Use yt-dlp Proxy")]
-        [Description("Use the local yt-dlp/ffmpeg proxy for playback")]
-        public bool UseYtProxy { get; set; } = true;
+        [DisplayName("My YouTube Content")]
+        [Description("Separate entries with a comma: @Handle for channels, PLxxx for playlists, or plain text for search queries. Example: @GitHub, PL0lo9MOBetEFcp4SCWinBdpml9B2U25-f, Linux Tutorials")]
+        public string SavedItems { get; set; } = "";
 
-        [DisplayName("yt-dlp Proxy URL")]
-        [Description("Example: http://localhost:8080")]
-        public string YtProxyUrl { get; set; } = "http://localhost:8080";
+        [DisplayName("Max Videos (Channels & Playlists)")]
+        [Description("Maximum number of videos to load per channel or playlist (1-150).")]
+        public int MaxChannelVideos { get; set; } = 50;
 
-        [DisplayName("Max Videos for Channels/Playlists")]
-        public int MaxChannelVideos { get; set; } = 60;
-
-        [DisplayName("Max Videos for Search")]
-        public int MaxSearchVideos { get; set; } = 150;
-
-        [DisplayName("My YouTube Content (Comma-separated)")]
-        [Description("Channels: @Handle | Playlists: PL... | Searches: regular words")]
-        public string SavedItems { get; set; } = "@GitHub, PL0lo9MOBetEFcp4SCWinBdpml9B2U25-f, Minecraft Trailer";
+        [DisplayName("Max Videos (Search)")]
+        [Description("Maximum number of videos to load per search query (1-150).")]
+        public int MaxSearchVideos { get; set; } = 50;
     }
 }

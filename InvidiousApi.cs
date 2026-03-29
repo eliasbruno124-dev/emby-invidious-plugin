@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net.Http;
@@ -11,10 +11,7 @@ namespace Emby.InvidiousPlugin
 {
     public class InvidiousApi
     {
-        private static readonly HttpClient Http = new HttpClient(new HttpClientHandler
-        {
-            AllowAutoRedirect = false
-        });
+        private static readonly HttpClient Http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false });
 
         private static Uri BaseUri(string baseUrl) => new Uri((baseUrl ?? "").TrimEnd('/') + "/");
 
@@ -30,13 +27,10 @@ namespace Emby.InvidiousPlugin
             var baseUri = BaseUri(baseUrl);
             var auth = BuildAuthorizationFromUserInfo(baseUri);
             var url = new Uri(baseUri, relative.TrimStart('/'));
-
             var req = new HttpRequestMessage(HttpMethod.Get, url);
             req.Headers.TryAddWithoutValidation("Accept", "application/json");
-
             if (!string.IsNullOrWhiteSpace(auth))
                 req.Headers.TryAddWithoutValidation("Authorization", auth);
-
             return req;
         }
 
@@ -45,7 +39,6 @@ namespace Emby.InvidiousPlugin
             using var req = CreateGet(baseUrl, relative);
             using var resp = await Http.SendAsync(req, ct).ConfigureAwait(false);
             resp.EnsureSuccessStatusCode();
-
             await using var s = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
             return await JsonDocument.ParseAsync(s, cancellationToken: ct).ConfigureAwait(false);
         }
@@ -62,10 +55,7 @@ namespace Emby.InvidiousPlugin
                     if (root.ValueKind == JsonValueKind.Array && root.GetArrayLength() > 0)
                     {
                         var first = root[0];
-                        var authorId = GetString(first, "authorId");
-                        var author = GetString(first, "author");
-                        var thumb = GetHighestResThumb(first, "authorThumbnails");
-                        return (authorId, author, thumb);
+                        return (GetString(first, "authorId"), GetString(first, "author"), GetHighestResThumb(first, "authorThumbnails"));
                     }
                 }
                 else
@@ -73,15 +63,10 @@ namespace Emby.InvidiousPlugin
                     var id = Uri.EscapeDataString(query);
                     using var doc = await GetJsonAsync(baseUrl, $"api/v1/channels/{id}", ct).ConfigureAwait(false);
                     var root = doc.RootElement;
-                    var author = GetString(root, "author");
-                    var thumb = GetHighestResThumb(root, "authorThumbnails");
-                    return (id, author, thumb);
+                    return (id, GetString(root, "author"), GetHighestResThumb(root, "authorThumbnails"));
                 }
             }
-            catch
-            {
-            }
-
+            catch { }
             return (null, null, null);
         }
 
@@ -92,14 +77,9 @@ namespace Emby.InvidiousPlugin
                 var escId = Uri.EscapeDataString(id);
                 using var doc = await GetJsonAsync(baseUrl, $"api/v1/playlists/{escId}", ct).ConfigureAwait(false);
                 var root = doc.RootElement;
-                var title = GetString(root, "title");
-                var thumb = GetHighestResThumb(root, "playlistThumbnails");
-                return (title, thumb);
+                return (GetString(root, "title"), GetHighestResThumb(root, "playlistThumbnails"));
             }
-            catch
-            {
-            }
-
+            catch { }
             return (null, null);
         }
 
@@ -109,24 +89,16 @@ namespace Emby.InvidiousPlugin
             {
                 string? bestUrl = null;
                 int bestWidth = 0;
-
                 foreach (var thumb in arr.EnumerateArray())
                 {
                     var url = GetString(thumb, "url");
                     if (string.IsNullOrWhiteSpace(url)) continue;
                     if (url.StartsWith("//")) url = "https:" + url;
-
                     var w = GetInt(thumb, "width") ?? 0;
-                    if (w >= bestWidth)
-                    {
-                        bestWidth = w;
-                        bestUrl = url;
-                    }
+                    if (w >= bestWidth) { bestWidth = w; bestUrl = url; }
                 }
-
                 return bestUrl;
             }
-
             return null;
         }
 
@@ -154,52 +126,54 @@ namespace Emby.InvidiousPlugin
             return GetJsonAsync(baseUrl, $"api/v1/videos/{id}", ct);
         }
 
-        public (string? mp4, string? dash, string? hls) ExtractAllStreams(string baseUrl, JsonDocument videoDoc)
-        {
-            var root = videoDoc.RootElement;
-
-            string? dashUrl = GetString(root, "dashUrl");
-            if (!string.IsNullOrEmpty(dashUrl) && dashUrl.StartsWith("/")) dashUrl = baseUrl + dashUrl;
-
-            string? hlsUrl = GetString(root, "hlsUrl");
-            if (!string.IsNullOrEmpty(hlsUrl) && hlsUrl.StartsWith("/")) hlsUrl = baseUrl + hlsUrl;
-
-            var candidates = new List<(string url, int bitrate, string container)>();
-
-            if (root.TryGetProperty("formatStreams", out var arr) && arr.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var el in arr.EnumerateArray())
-                {
-                    var url = GetString(el, "url");
-                    if (string.IsNullOrWhiteSpace(url)) continue;
-                    var bitrate = GetInt(el, "bitrate") ?? 0;
-                    var container = GetString(el, "container") ?? "";
-                    candidates.Add((url!, bitrate, container));
-                }
-            }
-
-            string? mp4Url = null;
-            if (candidates.Count > 0)
-            {
-                mp4Url = candidates
-                    .Where(c => c.container.ToLowerInvariant().Contains("mp4"))
-                    .OrderByDescending(c => c.bitrate)
-                    .FirstOrDefault().url ?? candidates.OrderByDescending(c => c.bitrate).First().url;
-            }
-
-            return (mp4Url, dashUrl, hlsUrl);
-        }
-
         public static Dictionary<string, string> BuildPlaybackHeaders(string baseUrl)
         {
             var headers = new Dictionary<string, string>();
             var baseUri = BaseUri(baseUrl);
             var auth = BuildAuthorizationFromUserInfo(baseUri);
-
-            if (!string.IsNullOrWhiteSpace(auth))
-                headers["Authorization"] = auth!;
-
+            if (!string.IsNullOrWhiteSpace(auth)) headers["Authorization"] = auth!;
             return headers;
+        }
+
+        public static string GetCleanBaseUrl(string baseUrl)
+        {
+            try
+            {
+                var uri = new Uri((baseUrl ?? "").TrimEnd('/') + "/");
+                var port = uri.IsDefaultPort ? "" : ":" + uri.Port;
+                return $"{uri.Scheme}://{uri.Host}{port}{uri.AbsolutePath}".TrimEnd('/');
+            }
+            catch
+            {
+                return (baseUrl ?? "").TrimEnd('/');
+            }
+        }
+
+        /// <summary>
+        /// Returns base URL with URL-encoded credentials safe for FFmpeg.
+        /// "https://Elias:Lumaca124!@host" → "https://Elias:Lumaca124%21@host"
+        /// This avoids needing -headers which doesn't work reliably.
+        /// </summary>
+        public static string GetFfmpegSafeBaseUrl(string baseUrl)
+        {
+            try
+            {
+                var uri = new Uri((baseUrl ?? "").TrimEnd('/') + "/");
+                if (string.IsNullOrWhiteSpace(uri.UserInfo))
+                    return GetCleanBaseUrl(baseUrl);
+
+                // Split user:password and URL-encode each part
+                var parts = uri.UserInfo.Split(new[] { ':' }, 2);
+                var user = Uri.EscapeDataString(Uri.UnescapeDataString(parts[0]));
+                var pass = parts.Length > 1 ? Uri.EscapeDataString(Uri.UnescapeDataString(parts[1])) : "";
+                var port = uri.IsDefaultPort ? "" : ":" + uri.Port;
+                var cred = string.IsNullOrEmpty(pass) ? user : $"{user}:{pass}";
+                return $"{uri.Scheme}://{cred}@{uri.Host}{port}{uri.AbsolutePath}".TrimEnd('/');
+            }
+            catch
+            {
+                return (baseUrl ?? "").TrimEnd('/');
+            }
         }
 
         public static string? GetString(JsonElement el, string name)
@@ -214,10 +188,8 @@ namespace Emby.InvidiousPlugin
         {
             if (el.ValueKind != JsonValueKind.Object) return null;
             if (!el.TryGetProperty(name, out var p)) return null;
-
             if (p.ValueKind == JsonValueKind.Number && p.TryGetInt32(out var i)) return i;
             if (p.ValueKind == JsonValueKind.String && int.TryParse(p.GetString(), out var s)) return s;
-
             return null;
         }
 
@@ -225,10 +197,8 @@ namespace Emby.InvidiousPlugin
         {
             if (el.ValueKind != JsonValueKind.Object) return null;
             if (!el.TryGetProperty(name, out var p)) return null;
-
             if (p.ValueKind == JsonValueKind.Number && p.TryGetInt64(out var i)) return i;
             if (p.ValueKind == JsonValueKind.String && long.TryParse(p.GetString(), out var s)) return s;
-
             return null;
         }
     }
