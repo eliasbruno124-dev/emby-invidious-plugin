@@ -101,11 +101,13 @@ namespace Emby.InvidiousPlugin
                 // FFmpeg: read direct CDN URLs (no auth!) → HLS segments
                 // -c copy = no re-encoding
                 // -hls_time 4 = 4-second segments
-                // -hls_list_size 0 = keep all in playlist
-                // -hls_flags append_list = update playlist as segments arrive
+                // -hls_list_size 0       = keep ALL segments in playlist
+                // -hls_playlist_type event = tells player "playlist is growing, keep polling"
+                // -hls_flags append_list   = append new segments to existing playlist
+                // -hls_time 6              = 6-second segments (more stable than 4)
                 var args = $"-y -i \"{directVideoUrl}\" -i \"{directAudioUrl}\" " +
                            $"-c:v copy -c:a copy " +
-                           $"-f hls -hls_time 4 -hls_list_size 0 -hls_flags append_list " +
+                           $"-f hls -hls_time 6 -hls_list_size 0 -hls_playlist_type event -hls_flags append_list " +
                            $"-hls_segment_filename \"{segPattern}\" \"{m3u8}\"";
 
                 Log($"Starting FFmpeg...");
@@ -148,6 +150,21 @@ namespace Emby.InvidiousPlugin
                     finally
                     {
                         Log($"FFmpeg finished for {videoId}: exit={process.ExitCode}");
+                        // Append #EXT-X-ENDLIST to signal "playlist is complete"
+                        // Without this, Emby keeps waiting for more segments forever
+                        try
+                        {
+                            if (File.Exists(m3u8))
+                            {
+                                var content = File.ReadAllText(m3u8);
+                                if (!content.Contains("#EXT-X-ENDLIST"))
+                                {
+                                    File.AppendAllText(m3u8, "\n#EXT-X-ENDLIST\n");
+                                    Log("Appended #EXT-X-ENDLIST to playlist");
+                                }
+                            }
+                        }
+                        catch { }
                     }
                 });
 
