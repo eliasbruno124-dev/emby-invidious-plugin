@@ -93,7 +93,7 @@ namespace Emby.InvidiousPlugin
                         else if (type == "channel") doc = await api.GetChannelVideosAsync(baseUrl, term, currentPage, cancellationToken).ConfigureAwait(false);
                         else if (type == "playlist") doc = await api.GetPlaylistVideosAsync(baseUrl, term, currentPage, cancellationToken).ConfigureAwait(false);
                         if (doc == null) break;
-                        var tempItems = ExtractVideos(doc);
+                        var tempItems = ExtractVideos(doc, baseUrl);
                         doc.Dispose();
                         if (tempItems.Count == 0) break;
 
@@ -152,9 +152,10 @@ namespace Emby.InvidiousPlugin
         // ═══════════════════════════════════════════════════════════
         // VIDEO LIST PARSING
         // ═══════════════════════════════════════════════════════════
-        private List<ChannelItemInfo> ExtractVideos(JsonDocument doc)
+        private List<ChannelItemInfo> ExtractVideos(JsonDocument doc, string baseUrl)
         {
             var list = new List<ChannelItemInfo>();
+            var thumbBase = InvidiousApi.GetCleanBaseUrl(baseUrl);
             JsonElement arr = default;
             bool found = false;
             if (doc.RootElement.ValueKind == JsonValueKind.Array) { arr = doc.RootElement; found = true; }
@@ -184,7 +185,7 @@ namespace Emby.InvidiousPlugin
                     Id = videoId,
                     Type = ChannelItemType.Media,
                     MediaType = ChannelMediaType.Video,
-                    ImageUrl = $"https://img.youtube.com/vi/{videoId}/hqdefault.jpg"
+                    ImageUrl = $"{thumbBase}/vi/{videoId}/hqdefault.jpg"
                 });
             }
             return list;
@@ -208,13 +209,13 @@ namespace Emby.InvidiousPlugin
 
                 // ── Find best h264 adaptive video stream ──
                 string? bestVideoItag = null;
-                string? bestVideoUrl = null;
+                string? bestVideoUrl = null;  // Direct CDN URL (no auth needed!)
                 int bestVideoHeight = 0;
                 string? bestVideoLabel = null;
 
                 // ── Find best audio stream (mp4/m4a only) ──
                 string? bestAudioItag = null;
-                string? bestAudioUrl = null;
+                string? bestAudioUrl = null;  // Direct CDN URL
                 int bestAudioBitrate = 0;
 
                 if (root.TryGetProperty("adaptiveFormats", out var adaptive) && adaptive.ValueKind == JsonValueKind.Array)
@@ -223,9 +224,10 @@ namespace Emby.InvidiousPlugin
                     {
                         var type = InvidiousApi.GetString(el, "type") ?? "";
                         var itag = InvidiousApi.GetString(el, "itag");
-                        var url = InvidiousApi.GetString(el, "url");
+                        var url = InvidiousApi.GetString(el, "url");  // Direct googlevideo.com URL
                         if (string.IsNullOrEmpty(itag)) continue;
 
+                        // Video: only h264 (avc1) in mp4 container
                         if (type.StartsWith("video/mp4") && type.Contains("avc1"))
                         {
                             int h = ParseHeightFromElement(el);
@@ -238,6 +240,7 @@ namespace Emby.InvidiousPlugin
                             }
                         }
 
+                        // Audio: mp4a/m4a only (not opus/webm)
                         if (type.StartsWith("audio/mp4") || type.StartsWith("audio/m4a"))
                         {
                             int br = InvidiousApi.GetInt(el, "bitrate") ?? 0;
@@ -272,6 +275,9 @@ namespace Emby.InvidiousPlugin
                 // ── 1080p+ via FFmpeg HLS mux ──
                 if (bestVideoItag != null && bestAudioItag != null && bestVideoHeight > fallbackHeight)
                 {
+                    // Strategy:
+                    //   1. Try direct CDN URLs (fast, works when IPs match e.g. Windows)
+                    //   2. Fallback: Invidious proxy URLs (always works, no auth needed on internal network)
                     string ffmpegVideoUrl, ffmpegAudioUrl;
                     if (!string.IsNullOrEmpty(bestVideoUrl) && !string.IsNullOrEmpty(bestAudioUrl))
                     {
@@ -289,6 +295,7 @@ namespace Emby.InvidiousPlugin
                         ffmpegVideoUrl, ffmpegAudioUrl, id, bestVideoHeight
                     ).ConfigureAwait(false);
 
+                    // If CDN URLs failed, retry with Invidious proxy
                     if (string.IsNullOrEmpty(m3u8Path) && !string.IsNullOrEmpty(bestVideoUrl))
                     {
                         var cleanBase = InvidiousApi.GetCleanBaseUrl(baseUrl);
@@ -377,8 +384,14 @@ namespace Emby.InvidiousPlugin
         // ═══════════════════════════════════════════════════════════
         // HELPERS
         // ═══════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Parses video height from Invidious JSON element.
+        /// Tries: "size" ("1920x1080") → "resolution" ("1080p") → "qualityLabel" ("1080p60")
+        /// </summary>
         private static int ParseHeightFromElement(JsonElement el)
         {
+            // Try "size": "1920x1080"
             var size = InvidiousApi.GetString(el, "size");
             if (!string.IsNullOrEmpty(size))
             {
@@ -387,6 +400,7 @@ namespace Emby.InvidiousPlugin
                     return h;
             }
 
+            // Try "resolution": "1080p"
             var res = InvidiousApi.GetString(el, "resolution");
             if (!string.IsNullOrEmpty(res))
             {
@@ -394,6 +408,7 @@ namespace Emby.InvidiousPlugin
                 if (n > 0) return n;
             }
 
+            // Try "qualityLabel": "1080p60"
             var ql = InvidiousApi.GetString(el, "qualityLabel");
             if (!string.IsNullOrEmpty(ql))
             {

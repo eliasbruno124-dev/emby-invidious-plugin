@@ -98,16 +98,21 @@ namespace Emby.InvidiousPlugin
 
                 var segPattern = Path.Combine(videoDir, "seg_%04d.ts");
 
-                // FFmpeg: read direct CDN URLs (no auth!) → HLS segments
-                // -c copy = no re-encoding
-                // -hls_time 4 = 4-second segments
-                // -hls_list_size 0       = keep ALL segments in playlist
-                // -hls_playlist_type event = tells player "playlist is growing, keep polling"
-                // -hls_flags append_list   = append new segments to existing playlist
-                // -hls_time 6              = 6-second segments (more stable than 4)
-                var args = $"-y -i \"{directVideoUrl}\" -i \"{directAudioUrl}\" " +
+                // FFmpeg args explained:
+                // -ss 0                      = start from the very beginning (force)
+                // -fflags +genpts+discardcorrupt = regenerate timestamps, discard corrupt frames
+                // -c:v copy -c:a copy        = no re-encoding
+                // -bsf:v h264_mp4toannexb    = convert H.264 to Annex B format (required for .ts)
+                // -hls_time 6                = 6-second segments
+                // -hls_list_size 0           = keep all segments in playlist
+                // -hls_flags append_list     = update playlist as segments arrive
+                // -start_number 0            = first segment is 0
+                var args = $"-y -ss 0 " +
+                           $"-i \"{directVideoUrl}\" -i \"{directAudioUrl}\" " +
+                           $"-fflags +genpts+discardcorrupt " +
                            $"-c:v copy -c:a copy " +
-                           $"-f hls -hls_time 6 -hls_list_size 0 -hls_playlist_type event -hls_flags append_list " +
+                           $"-bsf:v h264_mp4toannexb " +
+                           $"-f hls -hls_time 6 -hls_list_size 0 -hls_flags append_list -start_number 0 " +
                            $"-hls_segment_filename \"{segPattern}\" \"{m3u8}\"";
 
                 Log($"Starting FFmpeg...");
