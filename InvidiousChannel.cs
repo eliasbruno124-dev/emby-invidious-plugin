@@ -155,7 +155,6 @@ namespace Emby.InvidiousPlugin
         private List<ChannelItemInfo> ExtractVideos(JsonDocument doc, string baseUrl)
         {
             var list = new List<ChannelItemInfo>();
-            var thumbBase = InvidiousApi.GetCleanBaseUrl(baseUrl);
             JsonElement arr = default;
             bool found = false;
             if (doc.RootElement.ValueKind == JsonValueKind.Array) { arr = doc.RootElement; found = true; }
@@ -185,7 +184,7 @@ namespace Emby.InvidiousPlugin
                     Id = videoId,
                     Type = ChannelItemType.Media,
                     MediaType = ChannelMediaType.Video,
-                    ImageUrl = $"{thumbBase}/vi/{videoId}/hqdefault.jpg"
+                    ImageUrl = $"https://i.ytimg.com/vi/{videoId}/hqdefault.jpg"
                 });
             }
             return list;
@@ -217,6 +216,7 @@ namespace Emby.InvidiousPlugin
                 string? bestAudioItag = null;
                 string? bestAudioUrl = null;  // Direct CDN URL
                 int bestAudioBitrate = 0;
+                bool bestAudioIsOriginal = false;
 
                 if (root.TryGetProperty("adaptiveFormats", out var adaptive) && adaptive.ValueKind == JsonValueKind.Array)
                 {
@@ -241,14 +241,43 @@ namespace Emby.InvidiousPlugin
                         }
 
                         // Audio: mp4a/m4a only (not opus/webm)
+                        // Prefer original audio track over AI-dubbed versions
                         if (type.StartsWith("audio/mp4") || type.StartsWith("audio/m4a"))
                         {
                             int br = InvidiousApi.GetInt(el, "bitrate") ?? 0;
-                            if (br > bestAudioBitrate)
+                            bool isOriginal = false;
+
+                            // Check if this is the original/default audio track
+                            if (el.TryGetProperty("audioTrack", out var audioTrack) && audioTrack.ValueKind == JsonValueKind.Object)
+                            {
+                                if (audioTrack.TryGetProperty("audioIsDefault", out var defProp))
+                                {
+                                    if (defProp.ValueKind == JsonValueKind.True)
+                                        isOriginal = true;
+                                    else if (defProp.ValueKind == JsonValueKind.String)
+                                        isOriginal = defProp.GetString()?.Equals("true", StringComparison.OrdinalIgnoreCase) == true;
+                                }
+                            }
+                            // No audioTrack info at all → treat as original (old API / single-track video)
+                            else
+                            {
+                                isOriginal = true;
+                            }
+
+                            // Prefer original track; among same priority pick highest bitrate
+                            bool currentIsOriginal = bestAudioIsOriginal;
+                            bool shouldReplace = false;
+                            if (isOriginal && !currentIsOriginal)
+                                shouldReplace = true;  // Always prefer original over dubbed
+                            else if (isOriginal == currentIsOriginal && br > bestAudioBitrate)
+                                shouldReplace = true;  // Same priority → pick higher bitrate
+
+                            if (shouldReplace)
                             {
                                 bestAudioBitrate = br;
                                 bestAudioItag = itag;
                                 bestAudioUrl = url;
+                                bestAudioIsOriginal = isOriginal;
                             }
                         }
                     }
