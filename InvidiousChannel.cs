@@ -1,4 +1,5 @@
 using MediaBrowser.Controller.Channels;
+using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Providers;
 using MediaBrowser.Model.Channels;
 using MediaBrowser.Model.Dto;
@@ -16,7 +17,7 @@ using System.Threading.Tasks;
 
 namespace Emby.InvidiousPlugin
 {
-    public class InvidiousChannel : IChannel, IRequiresMediaInfoCallback
+    public class InvidiousChannel : IChannel, IRequiresMediaInfoCallback, ISearchableChannel
     {
         public string Name => "Invidious";
         public string Description => "Privacy-friendly YouTube";
@@ -408,6 +409,76 @@ namespace Emby.InvidiousPlugin
             }
 
             return sources;
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // SEARCH (ISearchableChannel)
+        // ═══════════════════════════════════════════════════════════
+        public async Task<IEnumerable<ChannelItemInfo>> Search(ChannelSearchInfo searchInfo, User user, CancellationToken cancellationToken)
+        {
+            var items = new List<ChannelItemInfo>();
+            var plugin = Plugin.Instance;
+            if (plugin == null) return items;
+            var config = plugin.Options;
+            var baseUrl = (config.InvidiousUrl ?? "").TrimEnd('/');
+            if (string.IsNullOrWhiteSpace(baseUrl)) return items;
+
+            var query = searchInfo?.SearchTerm ?? "";
+            if (string.IsNullOrWhiteSpace(query)) return items;
+
+            try
+            {
+                var api = new InvidiousApi();
+                int limit = config.MaxSearchVideos;
+                if (limit <= 0) limit = 50;
+                if (limit > 150) limit = 150;
+
+                int page = 1;
+                var seenIds = new HashSet<string>();
+
+                while (items.Count < limit)
+                {
+                    using var doc = await api.SearchVideosAsync(baseUrl, query, page, cancellationToken).ConfigureAwait(false);
+                    var batch = ExtractVideos(doc, baseUrl)
+                        .Where(v => seenIds.Add(v.Id))
+                        .Take(limit - items.Count)
+                        .ToList();
+                    if (batch.Count == 0) break;
+
+                    // Fetch full details in parallel (description, dates, duration)
+                    var sem = new SemaphoreSlim(20);
+                    await Task.WhenAll(batch.Select(async item =>
+                    {
+                        await sem.WaitAsync();
+                        try
+                        {
+                            using var vDoc = await api.GetVideoAsync(baseUrl, item.Id, cancellationToken).ConfigureAwait(false);
+                            var r = vDoc.RootElement;
+                            var desc = InvidiousApi.GetString(r, "description");
+                            var views = InvidiousApi.GetLong(r, "viewCount");
+                            if (!string.IsNullOrWhiteSpace(desc))
+                                item.Overview = (views > 0 ? $"👁 {views:N0} Aufrufe\n\n" : "") + desc;
+                            var pub = InvidiousApi.GetLong(r, "published");
+                            if (pub.HasValue)
+                            {
+                                var dt = DateTimeOffset.FromUnixTimeSeconds(pub.Value).UtcDateTime;
+                                item.PremiereDate = dt; item.DateCreated = dt; item.ProductionYear = dt.Year;
+                            }
+                            var len = InvidiousApi.GetInt(r, "lengthSeconds");
+                            if (len > 0) item.RunTimeTicks = TimeSpan.FromSeconds(len.Value).Ticks;
+                        }
+                        catch { }
+                        finally { sem.Release(); }
+                    })).ConfigureAwait(false);
+
+                    items.AddRange(batch);
+                    if (batch.Count < 10) break;
+                    page++;
+                }
+            }
+            catch { }
+
+            return items;
         }
 
         // ═══════════════════════════════════════════════════════════
