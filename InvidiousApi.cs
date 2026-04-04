@@ -94,6 +94,18 @@ namespace Emby.InvidiousPlugin
                     var url = GetString(thumb, "url");
                     if (string.IsNullOrWhiteSpace(url)) continue;
                     if (url.StartsWith("//")) url = "https:" + url;
+
+                    // Convert Invidious-proxied thumbnails to public YouTube CDN
+                    // e.g. https://invidious.example.com/ggpht/... → https://yt3.ggpht.com/...
+                    var ggphtIdx = url.IndexOf("/ggpht/");
+                    if (ggphtIdx >= 0 && !url.Contains("yt3.ggpht.com"))
+                        url = "https://yt3.ggpht.com" + url.Substring(ggphtIdx + 6); // skip "/ggpht"
+
+                    // Also handle /vi/ proxy → i.ytimg.com
+                    var viIdx = url.IndexOf("/vi/");
+                    if (viIdx >= 0 && !url.Contains("i.ytimg.com") && !url.Contains("yt3.ggpht.com"))
+                        url = "https://i.ytimg.com" + url.Substring(viIdx);
+
                     var w = GetInt(thumb, "width") ?? 0;
                     if (w >= bestWidth) { bestWidth = w; bestUrl = url; }
                 }

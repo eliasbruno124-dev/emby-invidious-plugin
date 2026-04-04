@@ -73,6 +73,23 @@ namespace Emby.InvidiousPlugin
             }
         }
 
+        /// <summary>
+        /// Kill FFmpeg processes for all videos EXCEPT the given one.
+        /// Called when user starts playing a new video.
+        /// </summary>
+        public static void KillOtherVideos(string currentVideoId)
+        {
+            foreach (var kvp in RunningProcesses)
+            {
+                if (!kvp.Key.StartsWith(currentVideoId + "_"))
+                {
+                    try { if (!kvp.Value.HasExited) { kvp.Value.Kill(); Log($"Killed FFmpeg for other video: {kvp.Key}"); } }
+                    catch { }
+                    RunningProcesses.TryRemove(kvp.Key, out _);
+                }
+            }
+        }
+
         public static void KillAll()
         {
             foreach (var kvp in RunningProcesses)
@@ -81,6 +98,66 @@ namespace Emby.InvidiousPlugin
             }
             RunningProcesses.Clear();
             Log("Killed all FFmpeg processes");
+        }
+
+        /// <summary>
+        /// Returns the cached stream.m3u8 path if complete, null otherwise.
+        /// </summary>
+        public static string? GetCachedStreamPath(string videoId, int height)
+        {
+            var videoDir = Path.Combine(CacheDir, $"{videoId}_{height}p");
+            var m3u8 = Path.Combine(videoDir, "stream.m3u8");
+            var playback = Path.Combine(videoDir, "playback.m3u8");
+            try
+            {
+                if (!File.Exists(m3u8)) return null;
+                var age = DateTime.UtcNow - File.GetLastWriteTimeUtc(m3u8);
+                if (age.TotalDays > GetCacheDays()) return null;
+                var content = File.ReadAllText(m3u8);
+                if (content.Contains("#EXT-X-ENDLIST") && CountSegments(content) >= 6)
+                    return File.Exists(playback) ? playback : m3u8;
+            }
+            catch { }
+
+            // Also check if FFmpeg is currently running for this
+            var processKey = $"{videoId}_{height}p";
+            if (RunningProcesses.ContainsKey(processKey) && File.Exists(playback))
+                return playback;
+
+            return null;
+        }
+
+        /// <summary>
+        /// Returns the expected playback.m3u8 path for a given video+height
+        /// without starting any mux. Used to list sources before muxing.
+        /// Also ensures the directory exists.
+        /// </summary>
+        public static string GetExpectedPlaybackPath(string videoId, int height)
+        {
+            var videoDir = Path.Combine(CacheDir, $"{videoId}_{height}p");
+            try { Directory.CreateDirectory(videoDir); } catch { }
+            var playback = Path.Combine(videoDir, "playback.m3u8");
+            // Create minimal stub so Emby accepts the path before mux completes
+            if (!File.Exists(playback))
+            {
+                try { File.WriteAllText(playback, "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-ENDLIST\n"); }
+                catch { }
+            }
+            return playback;
+        }
+
+        /// <summary>
+        /// Gets cache duration in days from plugin settings.
+        /// </summary>
+        private static int GetCacheDays()
+        {
+            try
+            {
+                var plugin = Plugin.Instance;
+                if (plugin != null) return Math.Max(0, plugin.Options.CacheDays);
+            }
+            catch { }
+            return 3;
         }
 
         /// <summary>
@@ -114,7 +191,10 @@ namespace Emby.InvidiousPlugin
         {
             int segs = 0;
             foreach (var line in content.Split('\n'))
-                if (line.TrimEnd().EndsWith(".ts")) segs++;
+            {
+                var trimmed = line.TrimEnd();
+                if (trimmed.EndsWith(".ts") || trimmed.EndsWith(".m4s")) segs++;
+            }
             return segs;
         }
 
@@ -126,10 +206,10 @@ namespace Emby.InvidiousPlugin
         /// </summary>
         public static async Task<string?> MuxToHlsAsync(
             string directVideoUrl, string directAudioUrl,
-            string videoId, int height)
+            string videoId, int height, bool isVp9 = false)
         {
             var processKey = $"{videoId}_{height}p";
-            Log($"--- MuxToHlsAsync: {processKey}");
+            Log($"--- MuxToHlsAsync: {processKey} (codec={( isVp9 ? "vp9" : "h264" )})");
             Log($"VideoURL length: {directVideoUrl.Length}");
             Log($"AudioURL length: {directAudioUrl.Length}");
 
@@ -146,14 +226,19 @@ namespace Emby.InvidiousPlugin
                     return playback;
                 }
 
-                // Kill any previous FFmpeg for a different resolution
-                KillProcess(videoId);
+                // Kill only if same exact resolution is already running (e.g. retry)
+                // Don't kill other heights — they run in parallel
+                if (RunningProcesses.TryRemove(processKey, out var oldProc))
+                {
+                    try { if (!oldProc.HasExited) { oldProc.Kill(); Log($"Killed old FFmpeg for {processKey}"); } }
+                    catch { }
+                }
 
                 // Reuse completed cache
                 if (File.Exists(m3u8))
                 {
                     var age = DateTime.UtcNow - File.GetLastWriteTimeUtc(m3u8);
-                    if (age.TotalDays < 3)
+                    if (age.TotalDays < GetCacheDays())
                     {
                         var cached = File.ReadAllText(m3u8);
                         if (cached.Contains("#EXT-X-ENDLIST") && CountSegments(cached) >= 6)
@@ -173,7 +258,13 @@ namespace Emby.InvidiousPlugin
                 var ffmpeg = FindFfmpeg();
                 Log($"FFmpeg: {ffmpeg}");
 
-                var segPattern = Path.Combine(videoDir, "seg_%04d.ts");
+                // VP9 needs fMP4 segments (.m4s), H264 uses MPEG-TS (.ts)
+                string segExt = isVp9 ? "m4s" : "ts";
+                var segPattern = Path.Combine(videoDir, $"seg_%04d.{segExt}");
+
+                string codecArgs = isVp9
+                    ? "-c:v copy -c:a copy -hls_segment_type fmp4"                    // VP9 in fMP4
+                    : "-c:v copy -c:a copy -bsf:v h264_mp4toannexb";                  // H264 in MPEG-TS
 
                 var args = $"-y " +
                            $"-i \"{directVideoUrl}\" " +
@@ -181,8 +272,7 @@ namespace Emby.InvidiousPlugin
                            $"-map 0:v:0 -map 1:a:0 " +
                            $"-fflags +genpts+discardcorrupt " +
                            $"-avoid_negative_ts make_zero " +
-                           $"-c:v copy -c:a copy " +
-                           $"-bsf:v h264_mp4toannexb " +
+                           $"{codecArgs} " +
                            $"-f hls -hls_time 6 -hls_list_size 0 -hls_flags append_list -start_number 0 " +
                            $"-hls_segment_filename \"{segPattern}\" \"{m3u8}\"";
 
@@ -272,7 +362,7 @@ namespace Emby.InvidiousPlugin
                 });
 
                 // Wait until playback.m3u8 has enough segments
-                for (int i = 0; i < 120; i++) // max 60 seconds
+                for (int i = 0; i < 240; i++) // max 120 seconds (4K VP9 needs more time)
                 {
                     await Task.Delay(500).ConfigureAwait(false);
 
@@ -298,7 +388,7 @@ namespace Emby.InvidiousPlugin
                         {
                             var content = File.ReadAllText(playback);
                             int segs = CountSegments(content);
-                            if (segs >= 10)
+                            if (segs >= 6)
                             {
                                 Log($"SUCCESS: {segs} segments ready in playback.m3u8");
                                 return playback;
@@ -308,7 +398,7 @@ namespace Emby.InvidiousPlugin
                     }
                 }
 
-                Log("FAIL: Timeout 60s");
+                Log("FAIL: Timeout 120s");
                 try { process.Kill(); } catch { }
                 RunningProcesses.TryRemove(processKey, out _);
                 return null;
@@ -347,7 +437,7 @@ namespace Emby.InvidiousPlugin
             {
                 foreach (var d in Directory.GetDirectories(CacheDir))
                 {
-                    if ((DateTime.UtcNow - Directory.GetLastWriteTimeUtc(d)).TotalDays > 3)
+                    if ((DateTime.UtcNow - Directory.GetLastWriteTimeUtc(d)).TotalDays > GetCacheDays())
                         try { Directory.Delete(d, true); } catch { }
                 }
             }

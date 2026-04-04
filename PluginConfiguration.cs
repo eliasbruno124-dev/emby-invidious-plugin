@@ -22,5 +22,9 @@ namespace Emby.InvidiousPlugin
         [DisplayName("Max Videos (Search)")]
         [Description("Maximum number of videos to load per search query (1-150).")]
         public int MaxSearchVideos { get; set; } = 50;
+
+        [DisplayName("HLS Cache Duration (Days)")]
+        [Description("How many days to keep cached HLS segments (1080p/4K muxed streams). Set to 0 to disable caching.")]
+        public int CacheDays { get; set; } = 3;
     }
 }
