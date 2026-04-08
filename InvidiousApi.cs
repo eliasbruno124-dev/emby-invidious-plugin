@@ -152,6 +152,23 @@ namespace Emby.InvidiousPlugin
             return GetJsonAsync(baseUrl, $"api/v1/search?q={q}&type=video&page={page}", ct);
         }
 
+        public static Task<JsonDocument> GetTrendingAsync(string baseUrl, string? category, CancellationToken ct, string? region = null)
+        {
+            var parts = new List<string>();
+            if (!string.IsNullOrEmpty(category))
+                parts.Add($"type={Uri.EscapeDataString(category)}");
+            if (!string.IsNullOrEmpty(region))
+                parts.Add($"region={Uri.EscapeDataString(region)}");
+            var path = "api/v1/trending";
+            if (parts.Count > 0) path += "?" + string.Join("&", parts);
+            return GetJsonAsync(baseUrl, path, ct);
+        }
+
+        public static Task<JsonDocument> GetPopularAsync(string baseUrl, CancellationToken ct)
+        {
+            return GetJsonAsync(baseUrl, "api/v1/popular", ct);
+        }
+
         public static Task<JsonDocument> GetChannelVideosAsync(string baseUrl, string channelId, int page, CancellationToken ct)
         {
             var id = Uri.EscapeDataString(channelId ?? "");

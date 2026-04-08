@@ -36,6 +36,21 @@ namespace Emby.InvidiousPlugin
         public string SavedItems { get; set; } = "";
 
         // ─────────────────────────────────────────────────────────────────────
+        // DISCOVER
+        // ─────────────────────────────────────────────────────────────────────
+
+        [DisplayName("Show Trending")]
+        [Description("Show a 'Trending' folder with trending and popular videos from YouTube.")]
+        public bool ShowTrending { get; set; } = true;
+
+        [DisplayName("Trending Region")]
+        [Description(
+            "ISO 3166-1 country code for YouTube trending results.\n" +
+            "Examples: DE (Germany), US (USA), AT (Austria), CH (Switzerland), GB (UK), FR (France).\n" +
+            "Leave empty for Invidious default.")]
+        public string TrendingRegion { get; set; } = "DE";
+
+        // ─────────────────────────────────────────────────────────────────────
         // LIMITS
         // ─────────────────────────────────────────────────────────────────────
 

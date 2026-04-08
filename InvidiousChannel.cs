@@ -78,6 +78,9 @@ namespace Emby.InvidiousPlugin
             {
                 if (string.IsNullOrEmpty(query.FolderId))
                 {
+                    if (config.ShowTrending)
+                        items.Add(new ChannelItemInfo { Name = "Trending", Id = "trending_x_all", Type = ChannelItemType.Folder });
+
                     var savedItems = (config.SavedItems ?? "")
                         .Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
 
@@ -121,7 +124,7 @@ namespace Emby.InvidiousPlugin
                         }
                         return new ChannelItemInfo
                         {
-                            Name = term,
+                            Name = $"Search: {term}",
                             Id = $"search{FolderSeparator}{term}",
                             Type = ChannelItemType.Folder
                         };
@@ -139,6 +142,12 @@ namespace Emby.InvidiousPlugin
                     if (sepIdx < 0) return new ChannelItemResult { Items = items };
                     string type = query.FolderId.Substring(0, sepIdx);
                     string term = query.FolderId.Substring(sepIdx + FolderSeparator.Length);
+
+                    if (type == "trending")
+                    {
+                        string region = (config.TrendingRegion ?? "").Trim();
+                        return await LoadTrending(baseUrl, cancellationToken, region).ConfigureAwait(false);
+                    }
 
                     int startIndex = query.StartIndex ?? 0;
                     int limit = type == "search" ? ClampVideos(config.MaxSearchVideos) : ClampVideos(config.MaxChannelVideos);
@@ -282,6 +291,56 @@ namespace Emby.InvidiousPlugin
             {
                 return Msg(items, $"ERROR: {ex.Message}");
             }
+        }
+
+        private static async Task<ChannelItemResult> LoadTrending(
+            string baseUrl, CancellationToken ct, string region = "")
+        {
+            var allVideos = new List<ChannelItemInfo>();
+            var seenIds = new HashSet<string>();
+            string? reg = string.IsNullOrEmpty(region) ? null : region;
+
+            try
+            {
+                var tasks = new List<Task<JsonDocument?>>
+                {
+                    SafeGetJson(() => InvidiousApi.GetPopularAsync(baseUrl, ct)),
+                    SafeGetJson(() => InvidiousApi.GetTrendingAsync(baseUrl, null, ct, reg)),
+                    SafeGetJson(() => InvidiousApi.GetTrendingAsync(baseUrl, "music", ct, reg)),
+                    SafeGetJson(() => InvidiousApi.GetTrendingAsync(baseUrl, "gaming", ct, reg)),
+                    SafeGetJson(() => InvidiousApi.GetTrendingAsync(baseUrl, "movies", ct, reg)),
+                };
+                var results = await Task.WhenAll(tasks).ConfigureAwait(false);
+                foreach (var doc in results)
+                {
+                    if (doc == null) continue;
+                    foreach (var v in ExtractVideos(doc))
+                        if (seenIds.Add(v.Id)) allVideos.Add(v);
+                    doc.Dispose();
+                }
+            }
+            catch (Exception ex)
+            {
+                var err = new List<ChannelItemInfo>();
+                return Msg(err, $"ERROR: {ex.Message}");
+            }
+
+            if (allVideos.Count == 0)
+            {
+                var err = new List<ChannelItemInfo>();
+                return Msg(err, "No results.");
+            }
+
+            for (int i = 0; i < allVideos.Count; i++)
+                allVideos[i].Name = $"{(i + 1):D3} | {allVideos[i].Name}";
+
+            return new ChannelItemResult { Items = allVideos, TotalRecordCount = allVideos.Count };
+        }
+
+        private static async Task<JsonDocument?> SafeGetJson(Func<Task<JsonDocument>> factory)
+        {
+            try { return await factory().ConfigureAwait(false); }
+            catch { return null; }
         }
 
         private static List<ChannelItemInfo> ExtractVideos(JsonDocument doc)
