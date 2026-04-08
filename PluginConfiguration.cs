@@ -1,5 +1,6 @@
 using Emby.Web.GenericEdit;
 using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
 
 namespace Emby.InvidiousPlugin
 {
@@ -7,24 +8,57 @@ namespace Emby.InvidiousPlugin
     {
         public override string EditorTitle => "Invidious Plugin Settings";
 
-        [DisplayName("My Invidious Instance URL")]
-        [Description("Enter the URL of your self-hosted Invidious instance (e.g. http://localhost:3000). For Basic Auth use: https://User:Password@invidious.example.com")]
+        // ─────────────────────────────────────────────────────────────────────
+        // CONNECTION
+        // ─────────────────────────────────────────────────────────────────────
+
+        [DisplayName("Invidious Instance URL")]
+        [Description(
+            "The URL of your self-hosted Invidious instance.\n" +
+            "Examples:\n" +
+            "  • http://localhost:3000\n" +
+            "  • https://invidious.example.com\n" +
+            "  • https://User:Password@invidious.example.com  (Basic Auth)")]
         public string InvidiousUrl { get; set; } = "";
 
+        // ─────────────────────────────────────────────────────────────────────
+        // CONTENT SOURCES
+        // ─────────────────────────────────────────────────────────────────────
+
         [DisplayName("My YouTube Content")]
-        [Description("Separate entries with a comma: @Handle for channels, PLxxx for playlists, or plain text for search queries. Example: @GitHub, PL0lo9MOBetEFcp4SCWinBdpml9B2U25-f, Linux Tutorials")]
+        [Description(
+            "Comma-separated list of content sources. Three types are supported:\n" +
+            "  • @Handle  — a YouTube channel handle (e.g. @GitHub)\n" +
+            "  • UCxxxxxx — a YouTube channel ID (e.g. UCVHFbw7woebKtYXvKgG-Z6Q)\n" +
+            "  • PLxxxxxx — a playlist ID (e.g. PL0lo9MOBetEFcp4SCWinBdpml9B2U25-f)\n" +
+            "  • any text — a search query (e.g. Linux Tutorials)\n\n" +
+            "Example: @GitHub, PLxxxxxx, Linux Tutorials")]
         public string SavedItems { get; set; } = "";
 
-        [DisplayName("Max Videos (Channels & Playlists)")]
-        [Description("Maximum number of videos to load per channel or playlist (1-150).")]
+        // ─────────────────────────────────────────────────────────────────────
+        // LIMITS
+        // ─────────────────────────────────────────────────────────────────────
+
+        [DisplayName("Max Videos per Channel or Playlist")]
+        [Description("Maximum number of videos loaded per channel or playlist. Range: 1–150.")]
+        [Range(1, 150)]
         public int MaxChannelVideos { get; set; } = 50;
 
-        [DisplayName("Max Videos (Search)")]
-        [Description("Maximum number of videos to load per search query (1-150).")]
+        [DisplayName("Max Videos per Search Query")]
+        [Description("Maximum number of videos loaded per search query. Range: 1–150.")]
+        [Range(1, 150)]
         public int MaxSearchVideos { get; set; } = 50;
 
+        // ─────────────────────────────────────────────────────────────────────
+        // CACHING
+        // ─────────────────────────────────────────────────────────────────────
+
         [DisplayName("HLS Cache Duration (Days)")]
-        [Description("How many days to keep cached HLS segments (1080p/4K muxed streams). Set to 0 to disable caching.")]
+        [Description(
+            "How many days to keep muxed HLS segments on disk (used for 1080p and 4K streams).\n" +
+            "Set to 0 to disable caching — each playback will re-mux from scratch.\n" +
+            "Recommended: 3 days. Higher values save bandwidth but use more disk space.")]
+        [Range(0, 30)]
         public int CacheDays { get; set; } = 3;
     }
 }

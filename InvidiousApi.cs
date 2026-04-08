@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
-using System.Linq;
+using System.Diagnostics;
+using System.Net;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
@@ -9,48 +10,100 @@ using System.Threading.Tasks;
 
 namespace Emby.InvidiousPlugin
 {
-    public class InvidiousApi
+    public static class InvidiousApi
     {
-        private static readonly HttpClient Http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false });
+        private static readonly HttpClient Http = new HttpClient(
+            new SocketsHttpHandler
+            {
+                AllowAutoRedirect = false,
+                PooledConnectionLifetime = TimeSpan.FromMinutes(10),
+                ConnectTimeout = TimeSpan.FromSeconds(10),
+            })
+        {
+            Timeout = TimeSpan.FromSeconds(30),
+            DefaultRequestHeaders =
+            {
+                { "User-Agent", "EmbyInvidiousPlugin/1.0 (+https://github.com/eliasbruno124-dev/Emby-Invidious-Plugin)" },
+                { "Accept", "application/json" }
+            }
+        };
 
-        private static Uri BaseUri(string baseUrl) => new Uri((baseUrl ?? "").TrimEnd('/') + "/");
+        private static readonly int[] RetryDelaysMs = { 800, 2500 };
 
-        private static string? BuildAuthorizationFromUserInfo(Uri baseUri)
+        private static Uri BaseUri(string baseUrl) =>
+            new Uri((baseUrl ?? "").TrimEnd('/') + "/");
+
+        private static string? BuildAuthorizationHeader(Uri baseUri)
         {
             if (string.IsNullOrWhiteSpace(baseUri.UserInfo)) return null;
-            var bytes = Encoding.ASCII.GetBytes(baseUri.UserInfo);
+            var bytes = Encoding.UTF8.GetBytes(baseUri.UserInfo);
             return "Basic " + Convert.ToBase64String(bytes);
         }
 
-        private static HttpRequestMessage CreateGet(string baseUrl, string relative)
+        private static HttpRequestMessage CreateGetRequest(string baseUrl, string relativePath)
         {
             var baseUri = BaseUri(baseUrl);
-            var auth = BuildAuthorizationFromUserInfo(baseUri);
-            var url = new Uri(baseUri, relative.TrimStart('/'));
+            var auth = BuildAuthorizationHeader(baseUri);
+            var url = new Uri(baseUri, relativePath.TrimStart('/'));
             var req = new HttpRequestMessage(HttpMethod.Get, url);
-            req.Headers.TryAddWithoutValidation("Accept", "application/json");
             if (!string.IsNullOrWhiteSpace(auth))
                 req.Headers.TryAddWithoutValidation("Authorization", auth);
             return req;
         }
 
-        private static async Task<JsonDocument> GetJsonAsync(string baseUrl, string relative, CancellationToken ct)
+        private static bool IsTransientError(HttpStatusCode code) =>
+            code == HttpStatusCode.TooManyRequests ||
+            code == HttpStatusCode.InternalServerError ||
+            code == HttpStatusCode.BadGateway ||
+            code == HttpStatusCode.ServiceUnavailable ||
+            code == HttpStatusCode.GatewayTimeout;
+
+        private static async Task<JsonDocument> GetJsonAsync(string baseUrl, string relativePath, CancellationToken ct)
         {
-            using var req = CreateGet(baseUrl, relative);
-            using var resp = await Http.SendAsync(req, ct).ConfigureAwait(false);
-            resp.EnsureSuccessStatusCode();
-            await using var s = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-            return await JsonDocument.ParseAsync(s, cancellationToken: ct).ConfigureAwait(false);
+            HttpStatusCode lastStatus = 0;
+
+            for (int attempt = 0; attempt <= RetryDelaysMs.Length; attempt++)
+            {
+                if (attempt > 0)
+                    await Task.Delay(RetryDelaysMs[attempt - 1], ct).ConfigureAwait(false);
+
+                using var req = CreateGetRequest(baseUrl, relativePath);
+                using var resp = await Http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+
+                if (resp.IsSuccessStatusCode)
+                {
+                    await using var stream = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+                    return await JsonDocument.ParseAsync(stream, cancellationToken: ct).ConfigureAwait(false);
+                }
+
+                lastStatus = resp.StatusCode;
+                if (!IsTransientError(lastStatus))
+                    break;
+            }
+
+            throw new HttpRequestException($"Invidious returned HTTP {(int)lastStatus} for: {relativePath}");
         }
 
-        public async Task<(string? id, string? name, string? thumb)> GetChannelDetailsAsync(string baseUrl, string query, bool isHandle, CancellationToken ct)
+        private static async Task<JsonDocument?> TryGetJsonAsync(string baseUrl, string relativePath, CancellationToken ct)
+        {
+            try { return await GetJsonAsync(baseUrl, relativePath, ct).ConfigureAwait(false); }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[InvidiousApi] TryGetJsonAsync failed for {relativePath}: {ex.GetType().Name}: {ex.Message}");
+                return null;
+            }
+        }
+
+        public static async Task<(string? id, string? name, string? thumb)> GetChannelDetailsAsync(
+            string baseUrl, string query, bool isHandle, CancellationToken ct)
         {
             try
             {
                 if (isHandle)
                 {
                     var q = Uri.EscapeDataString(query);
-                    using var doc = await GetJsonAsync(baseUrl, $"api/v1/search?q={q}&type=channel", ct).ConfigureAwait(false);
+                    using var doc = await TryGetJsonAsync(baseUrl, $"api/v1/search?q={q}&type=channel", ct).ConfigureAwait(false);
+                    if (doc == null) return (null, null, null);
                     var root = doc.RootElement;
                     if (root.ValueKind == JsonValueKind.Array && root.GetArrayLength() > 0)
                     {
@@ -61,88 +114,73 @@ namespace Emby.InvidiousPlugin
                 else
                 {
                     var id = Uri.EscapeDataString(query);
-                    using var doc = await GetJsonAsync(baseUrl, $"api/v1/channels/{id}", ct).ConfigureAwait(false);
+                    using var doc = await TryGetJsonAsync(baseUrl, $"api/v1/channels/{id}", ct).ConfigureAwait(false);
+                    if (doc == null) return (null, null, null);
                     var root = doc.RootElement;
                     return (id, GetString(root, "author"), GetHighestResThumb(root, "authorThumbnails"));
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[InvidiousApi] GetChannelDetailsAsync failed for '{query}': {ex.GetType().Name}: {ex.Message}");
+            }
             return (null, null, null);
         }
 
-        public async Task<(string? name, string? thumb)> GetPlaylistDetailsAsync(string baseUrl, string id, CancellationToken ct)
+        public static async Task<(string? name, string? thumb)> GetPlaylistDetailsAsync(
+            string baseUrl, string id, CancellationToken ct)
         {
             try
             {
                 var escId = Uri.EscapeDataString(id);
-                using var doc = await GetJsonAsync(baseUrl, $"api/v1/playlists/{escId}", ct).ConfigureAwait(false);
+                using var doc = await TryGetJsonAsync(baseUrl, $"api/v1/playlists/{escId}", ct).ConfigureAwait(false);
+                if (doc == null) return (null, null);
                 var root = doc.RootElement;
-                return (GetString(root, "title"), GetHighestResThumb(root, "playlistThumbnails"));
+                var thumb = GetString(root, "playlistThumbnail") ?? GetHighestResThumb(root, "playlistThumbnails");
+                return (GetString(root, "title"), thumb);
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[InvidiousApi] GetPlaylistDetailsAsync failed for '{id}': {ex.GetType().Name}: {ex.Message}");
+            }
             return (null, null);
         }
 
-        private static string? GetHighestResThumb(JsonElement el, string propertyName)
-        {
-            if (el.TryGetProperty(propertyName, out var arr) && arr.ValueKind == JsonValueKind.Array)
-            {
-                string? bestUrl = null;
-                int bestWidth = 0;
-                foreach (var thumb in arr.EnumerateArray())
-                {
-                    var url = GetString(thumb, "url");
-                    if (string.IsNullOrWhiteSpace(url)) continue;
-                    if (url.StartsWith("//")) url = "https:" + url;
-
-                    // Convert Invidious-proxied thumbnails to public YouTube CDN
-                    // e.g. https://invidious.example.com/ggpht/... → https://yt3.ggpht.com/...
-                    var ggphtIdx = url.IndexOf("/ggpht/");
-                    if (ggphtIdx >= 0 && !url.Contains("yt3.ggpht.com"))
-                        url = "https://yt3.ggpht.com" + url.Substring(ggphtIdx + 6); // skip "/ggpht"
-
-                    // Also handle /vi/ proxy → i.ytimg.com
-                    var viIdx = url.IndexOf("/vi/");
-                    if (viIdx >= 0 && !url.Contains("i.ytimg.com") && !url.Contains("yt3.ggpht.com"))
-                        url = "https://i.ytimg.com" + url.Substring(viIdx);
-
-                    var w = GetInt(thumb, "width") ?? 0;
-                    if (w >= bestWidth) { bestWidth = w; bestUrl = url; }
-                }
-                return bestUrl;
-            }
-            return null;
-        }
-
-        public Task<JsonDocument> SearchVideosAsync(string baseUrl, string query, int page, CancellationToken ct)
+        public static Task<JsonDocument> SearchVideosAsync(string baseUrl, string query, int page, CancellationToken ct)
         {
             var q = Uri.EscapeDataString(query ?? "");
             return GetJsonAsync(baseUrl, $"api/v1/search?q={q}&type=video&page={page}", ct);
         }
 
-        public Task<JsonDocument> GetChannelVideosAsync(string baseUrl, string channelId, int page, CancellationToken ct)
+        public static Task<JsonDocument> GetChannelVideosAsync(string baseUrl, string channelId, int page, CancellationToken ct)
         {
             var id = Uri.EscapeDataString(channelId ?? "");
-            return GetJsonAsync(baseUrl, $"api/v1/channels/{id}/videos?page={page}", ct);
+            return GetJsonAsync(baseUrl, $"api/v1/channels/{id}/videos?page={page}&sort_by=newest", ct);
         }
 
-        public Task<JsonDocument> GetPlaylistVideosAsync(string baseUrl, string playlistId, int page, CancellationToken ct)
+        public static Task<JsonDocument> GetPlaylistVideosAsync(string baseUrl, string playlistId, int page, CancellationToken ct)
         {
             var id = Uri.EscapeDataString(playlistId ?? "");
             return GetJsonAsync(baseUrl, $"api/v1/playlists/{id}?page={page}", ct);
         }
 
-        public Task<JsonDocument> GetVideoAsync(string baseUrl, string videoId, CancellationToken ct)
+        public static Task<JsonDocument> GetVideoAsync(string baseUrl, string videoId, CancellationToken ct)
         {
             var id = Uri.EscapeDataString(videoId ?? "");
             return GetJsonAsync(baseUrl, $"api/v1/videos/{id}", ct);
+        }
+
+        public static Task<JsonDocument?> TryGetVideoAsync(string baseUrl, string videoId, CancellationToken ct)
+        {
+            var id = Uri.EscapeDataString(videoId ?? "");
+            return TryGetJsonAsync(baseUrl, $"api/v1/videos/{id}", ct);
         }
 
         public static Dictionary<string, string> BuildPlaybackHeaders(string baseUrl)
         {
             var headers = new Dictionary<string, string>();
             var baseUri = BaseUri(baseUrl);
-            var auth = BuildAuthorizationFromUserInfo(baseUri);
+            var auth = BuildAuthorizationHeader(baseUri);
             if (!string.IsNullOrWhiteSpace(auth)) headers["Authorization"] = auth!;
             return headers;
         }
@@ -155,45 +193,55 @@ namespace Emby.InvidiousPlugin
                 var port = uri.IsDefaultPort ? "" : ":" + uri.Port;
                 return $"{uri.Scheme}://{uri.Host}{port}{uri.AbsolutePath}".TrimEnd('/');
             }
-            catch
+            catch (Exception ex)
             {
+                Debug.WriteLine($"[InvidiousApi] GetCleanBaseUrl parse failed: {ex.Message}");
                 return (baseUrl ?? "").TrimEnd('/');
             }
         }
 
-        /// <summary>
-        /// Returns base URL with URL-encoded credentials safe for FFmpeg.
-        /// "https://Elias:Lumaca124!@host" → "https://Elias:Lumaca124%21@host"
-        /// This avoids needing -headers which doesn't work reliably.
-        /// </summary>
-        public static string GetFfmpegSafeBaseUrl(string baseUrl)
+        public static string? GetHighestResThumb(JsonElement el, string propertyName)
         {
-            try
-            {
-                var uri = new Uri((baseUrl ?? "").TrimEnd('/') + "/");
-                if (string.IsNullOrWhiteSpace(uri.UserInfo))
-                    return GetCleanBaseUrl(baseUrl);
+            if (!el.TryGetProperty(propertyName, out var arr) || arr.ValueKind != JsonValueKind.Array)
+                return null;
 
-                // Split user:password and URL-encode each part
-                var parts = uri.UserInfo.Split(new[] { ':' }, 2);
-                var user = Uri.EscapeDataString(Uri.UnescapeDataString(parts[0]));
-                var pass = parts.Length > 1 ? Uri.EscapeDataString(Uri.UnescapeDataString(parts[1])) : "";
-                var port = uri.IsDefaultPort ? "" : ":" + uri.Port;
-                var cred = string.IsNullOrEmpty(pass) ? user : $"{user}:{pass}";
-                return $"{uri.Scheme}://{cred}@{uri.Host}{port}{uri.AbsolutePath}".TrimEnd('/');
-            }
-            catch
+            string? bestUrl = null;
+            int bestWidth = 0;
+
+            foreach (var thumb in arr.EnumerateArray())
             {
-                return (baseUrl ?? "").TrimEnd('/');
+                var url = GetString(thumb, "url");
+                if (string.IsNullOrWhiteSpace(url)) continue;
+                url = RewriteThumbnailUrl(url);
+
+                var w = GetInt(thumb, "width") ?? 0;
+                if (w >= bestWidth) { bestWidth = w; bestUrl = url; }
             }
+
+            return bestUrl;
+        }
+
+        internal static string RewriteThumbnailUrl(string url)
+        {
+            if (url.StartsWith("//")) url = "https:" + url;
+
+            var ggphtIdx = url.IndexOf("/ggpht/", StringComparison.Ordinal);
+            if (ggphtIdx >= 0 && !url.Contains("yt3.ggpht.com", StringComparison.Ordinal))
+                url = "https://yt3.ggpht.com" + url.Substring(ggphtIdx + 6);
+
+            var viIdx = url.IndexOf("/vi/", StringComparison.Ordinal);
+            if (viIdx >= 0 && !url.Contains("i.ytimg.com", StringComparison.Ordinal)
+                           && !url.Contains("yt3.ggpht.com", StringComparison.Ordinal))
+                url = "https://i.ytimg.com" + url.Substring(viIdx);
+
+            return url;
         }
 
         public static string? GetString(JsonElement el, string name)
         {
             if (el.ValueKind != JsonValueKind.Object) return null;
             if (!el.TryGetProperty(name, out var p)) return null;
-            if (p.ValueKind == JsonValueKind.String) return p.GetString();
-            return p.ToString();
+            return p.ValueKind == JsonValueKind.String ? p.GetString() : p.ToString();
         }
 
         public static int? GetInt(JsonElement el, string name)

@@ -4,9 +4,9 @@ using MediaBrowser.Model.Channels;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Drawing;
 using MediaBrowser.Model.Entities;
-using MediaBrowser.Model.LiveTv;
 using MediaBrowser.Model.MediaInfo;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -19,158 +19,303 @@ namespace Emby.InvidiousPlugin
     public class InvidiousChannel : IChannel, IRequiresMediaInfoCallback
     {
         public string Name => "Invidious";
-        public string Description => "Privacy-friendly YouTube";
+        public string Description => "Privacy-friendly YouTube via your Invidious instance.";
         public string Id => "invidious_channel_20";
-        public string DataVersion => "6.0.0";
-        public ChannelType Type => ChannelType.TV;
+        public string DataVersion => "8.0.0";
         public ChannelParentalRating ParentalRating => ChannelParentalRating.GeneralAudience;
         public bool IsEnabledByDefault => true;
 
-        // ═══════════════════════════════════════════════════════════
-        // FOLDER LISTING
-        // ═══════════════════════════════════════════════════════════
-        public async Task<ChannelItemResult> GetChannelItems(InternalChannelItemQuery query, CancellationToken cancellationToken)
+        private const string ChannelIdPrefix = "UC";
+        private const int MinChannelIdLength = 20;
+        private const string PlaylistPrefix = "PL";
+        private const string HandlePrefix = "@";
+        private const string FolderSeparator = "_x_";
+        private const string Itag720p = "22";
+        private const string Itag480p = "18";
+        private const int MaxMetaCacheEntries = 2000;
+
+        private record VideoMeta(string? Overview, DateTime? Premiere, int? Year, long? RuntimeTicks, DateTime CachedAt);
+        private static readonly ConcurrentDictionary<string, VideoMeta> MetaCache = new();
+        private static readonly TimeSpan MetaCacheTtl = TimeSpan.FromHours(6);
+
+        public ChannelFeatures GetChannelFeatures()
+        {
+            return new ChannelFeatures();
+        }
+
+        private static void EvictExpiredMetaCache()
+        {
+            if (MetaCache.Count <= MaxMetaCacheEntries) return;
+            var now = DateTime.UtcNow;
+            foreach (var kvp in MetaCache)
+            {
+                if ((now - kvp.Value.CachedAt) > MetaCacheTtl)
+                    MetaCache.TryRemove(kvp.Key, out _);
+            }
+            if (MetaCache.Count <= MaxMetaCacheEntries) return;
+            var oldest = MetaCache
+                .OrderBy(kvp => kvp.Value.CachedAt)
+                .Take(MetaCache.Count - MaxMetaCacheEntries)
+                .Select(kvp => kvp.Key)
+                .ToList();
+            foreach (var key in oldest)
+                MetaCache.TryRemove(key, out _);
+        }
+
+        public async Task<ChannelItemResult> GetChannelItems(
+            InternalChannelItemQuery query, CancellationToken cancellationToken)
         {
             var items = new List<ChannelItemInfo>();
             var plugin = Plugin.Instance;
             if (plugin == null) return Msg(items, "ERROR: Plugin not initialized.");
+
             var config = plugin.Options;
             var baseUrl = (config.InvidiousUrl ?? "").TrimEnd('/');
-            if (string.IsNullOrWhiteSpace(baseUrl)) return Msg(items, "ERROR: Please set the Invidious URL in the plugin settings.");
+            if (string.IsNullOrWhiteSpace(baseUrl))
+                return Msg(items, "ERROR: Please configure the Invidious URL in the plugin settings.");
 
             try
             {
-                var api = new InvidiousApi();
-
-                // ── Root: show saved items as folders ──
                 if (string.IsNullOrEmpty(query.FolderId))
                 {
-                    var savedItems = (config.SavedItems ?? "").Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+                    var savedItems = (config.SavedItems ?? "")
+                        .Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+
                     var menuTasks = savedItems.Select(async s =>
                     {
                         var term = s.Trim();
                         if (string.IsNullOrEmpty(term)) return null;
-                        if (term.StartsWith("@"))
+
+                        if (term.StartsWith(HandlePrefix))
                         {
-                            var d = await api.GetChannelDetailsAsync(baseUrl, term, true, cancellationToken).ConfigureAwait(false);
-                            return new ChannelItemInfo { Name = $"📺 {d.name ?? term}", Id = $"channel_x_{d.id ?? term}", Type = ChannelItemType.Folder, ImageUrl = d.thumb };
+                            var d = await InvidiousApi.GetChannelDetailsAsync(baseUrl, term, true, cancellationToken).ConfigureAwait(false);
+                            return new ChannelItemInfo
+                            {
+                                Name = d.name ?? term,
+                                Id = $"channel{FolderSeparator}{d.id ?? term}",
+                                Type = ChannelItemType.Folder,
+                                ImageUrl = d.thumb
+                            };
                         }
-                        if (term.StartsWith("UC") && term.Length > 20)
+                        if (term.StartsWith(ChannelIdPrefix) && term.Length > MinChannelIdLength)
                         {
-                            var d = await api.GetChannelDetailsAsync(baseUrl, term, false, cancellationToken).ConfigureAwait(false);
-                            return new ChannelItemInfo { Name = $"📺 {d.name ?? "Channel"}", Id = $"channel_x_{term}", Type = ChannelItemType.Folder, ImageUrl = d.thumb };
+                            var d = await InvidiousApi.GetChannelDetailsAsync(baseUrl, term, false, cancellationToken).ConfigureAwait(false);
+                            return new ChannelItemInfo
+                            {
+                                Name = d.name ?? "Channel",
+                                Id = $"channel{FolderSeparator}{term}",
+                                Type = ChannelItemType.Folder,
+                                ImageUrl = d.thumb
+                            };
                         }
-                        if (term.StartsWith("PL"))
+                        if (term.StartsWith(PlaylistPrefix))
                         {
-                            var d = await api.GetPlaylistDetailsAsync(baseUrl, term, cancellationToken).ConfigureAwait(false);
-                            return new ChannelItemInfo { Name = $"🎵 {d.name ?? "Playlist"}", Id = $"playlist_x_{term}", Type = ChannelItemType.Folder, ImageUrl = d.thumb };
+                            var d = await InvidiousApi.GetPlaylistDetailsAsync(baseUrl, term, cancellationToken).ConfigureAwait(false);
+                            return new ChannelItemInfo
+                            {
+                                Name = d.name ?? "Playlist",
+                                Id = $"playlist{FolderSeparator}{term}",
+                                Type = ChannelItemType.Folder,
+                                ImageUrl = d.thumb
+                            };
                         }
-                        return new ChannelItemInfo { Name = $"🔍 {term}", Id = $"search_x_{term}", Type = ChannelItemType.Folder };
+                        return new ChannelItemInfo
+                        {
+                            Name = term,
+                            Id = $"search{FolderSeparator}{term}",
+                            Type = ChannelItemType.Folder
+                        };
                     });
+
                     foreach (var res in await Task.WhenAll(menuTasks).ConfigureAwait(false))
                         if (res != null) items.Add(res);
+
                     return new ChannelItemResult { Items = items, TotalRecordCount = items.Count };
                 }
 
-                // ── Sub-folder: load videos ──
-                if (query.FolderId.Contains("_x_"))
+                if (query.FolderId.Contains(FolderSeparator))
                 {
-                    var parts = query.FolderId.Split(new[] { '_' }, 3);
-                    if (parts.Length < 3) return new ChannelItemResult { Items = items, TotalRecordCount = 0 };
-                    string type = parts[0], term = parts[2];
+                    var sepIdx = query.FolderId.IndexOf(FolderSeparator, StringComparison.Ordinal);
+                    if (sepIdx < 0) return new ChannelItemResult { Items = items };
+                    string type = query.FolderId.Substring(0, sepIdx);
+                    string term = query.FolderId.Substring(sepIdx + FolderSeparator.Length);
+
                     int startIndex = query.StartIndex ?? 0;
-                    int limit = type == "search" ? config.MaxSearchVideos : config.MaxChannelVideos;
-                    if (limit <= 0) limit = 50;
-                    if (limit > 150) limit = 150;
-                    int currentPage = (startIndex / 20) + 1;
-                    int skipItems = startIndex % 20;
+                    int limit = type == "search" ? ClampVideos(config.MaxSearchVideos) : ClampVideos(config.MaxChannelVideos);
+
+                    int firstPageSize = -1;
+                    int lastPageSize = -1;
+                    int currentPage = 1;
+                    int skipItems = startIndex;
                     var seenIds = new HashSet<string>();
+                    bool seeking = startIndex > 0;
 
                     while (items.Count < limit)
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
+
                         JsonDocument? doc = null;
-                        if (type == "search") doc = await api.SearchVideosAsync(baseUrl, term, currentPage, cancellationToken).ConfigureAwait(false);
-                        else if (type == "channel") doc = await api.GetChannelVideosAsync(baseUrl, term, currentPage, cancellationToken).ConfigureAwait(false);
-                        else if (type == "playlist") doc = await api.GetPlaylistVideosAsync(baseUrl, term, currentPage, cancellationToken).ConfigureAwait(false);
+                        if (type == "search")
+                            doc = await InvidiousApi.SearchVideosAsync(baseUrl, term, currentPage, cancellationToken).ConfigureAwait(false);
+                        else if (type == "channel")
+                            doc = await InvidiousApi.GetChannelVideosAsync(baseUrl, term, currentPage, cancellationToken).ConfigureAwait(false);
+                        else if (type == "playlist")
+                            doc = await InvidiousApi.GetPlaylistVideosAsync(baseUrl, term, currentPage, cancellationToken).ConfigureAwait(false);
+
                         if (doc == null) break;
-                        var tempItems = ExtractVideos(doc, baseUrl);
+
+                        var tempItems = ExtractVideos(doc);
                         doc.Dispose();
-                        if (tempItems.Count == 0) break;
+                        lastPageSize = tempItems.Count;
+                        if (firstPageSize < 0) firstPageSize = lastPageSize;
+                        if (lastPageSize == 0) break;
 
                         var batch = new List<ChannelItemInfo>();
                         foreach (var item in tempItems)
                         {
                             if (skipItems > 0) { skipItems--; continue; }
+                            seeking = false;
                             if (seenIds.Add(item.Id)) batch.Add(item);
                             if (items.Count + batch.Count >= limit) break;
                         }
 
-                        // Fetch full details in parallel (description, views, date)
-                        var sem = new SemaphoreSlim(20);
-                        await Task.WhenAll(batch.Select(async item =>
+                        var uncached = new List<ChannelItemInfo>();
+                        foreach (var item in batch)
                         {
-                            await sem.WaitAsync();
+                            if (MetaCache.TryGetValue(item.Id, out var cached)
+                                && (DateTime.UtcNow - cached.CachedAt) < MetaCacheTtl)
+                            {
+                                if (!string.IsNullOrEmpty(cached.Overview)) item.Overview = cached.Overview;
+                                if (cached.Premiere.HasValue) { item.PremiereDate = cached.Premiere; item.DateCreated = cached.Premiere; }
+                                if (cached.Year.HasValue) item.ProductionYear = cached.Year;
+                                if (cached.RuntimeTicks.HasValue) item.RunTimeTicks = cached.RuntimeTicks;
+                            }
+                            else
+                            {
+                                uncached.Add(item);
+                            }
+                        }
+
+                        if (uncached.Count > 0)
+                        {
                             try
                             {
-                                using var vDoc = await api.GetVideoAsync(baseUrl, item.Id, cancellationToken).ConfigureAwait(false);
-                                var r = vDoc.RootElement;
-                                var desc = InvidiousApi.GetString(r, "description");
-                                var views = InvidiousApi.GetLong(r, "viewCount");
-                                if (!string.IsNullOrWhiteSpace(desc))
-                                    item.Overview = (views > 0 ? $"👁 {views:N0} Aufrufe\n\n" : "") + desc;
-                                var pub = InvidiousApi.GetLong(r, "published");
-                                if (pub.HasValue)
+                                using var enrichCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                                enrichCts.CancelAfter(TimeSpan.FromSeconds(15));
+                                var enrichToken = enrichCts.Token;
+
+                                using var sem = new SemaphoreSlim(10);
+                                await Task.WhenAll(uncached.Select(async item =>
                                 {
-                                    var dt = DateTimeOffset.FromUnixTimeSeconds(pub.Value).UtcDateTime;
-                                    item.PremiereDate = dt; item.DateCreated = dt; item.ProductionYear = dt.Year;
-                                }
-                                var len = InvidiousApi.GetInt(r, "lengthSeconds");
-                                if (len > 0) item.RunTimeTicks = TimeSpan.FromSeconds(len.Value).Ticks;
+                                    await sem.WaitAsync(enrichToken).ConfigureAwait(false);
+                                    try
+                                    {
+                                        using var vDoc = await InvidiousApi.TryGetVideoAsync(baseUrl, item.Id, enrichToken).ConfigureAwait(false);
+                                        if (vDoc == null) return;
+                                        var r = vDoc.RootElement;
+
+                                        var desc = InvidiousApi.GetString(r, "description");
+                                        var views = InvidiousApi.GetLong(r, "viewCount");
+                                        string? overview = null;
+                                        if (!string.IsNullOrWhiteSpace(desc))
+                                        {
+                                            overview = (views > 0 ? $"{views:N0} views\n\n" : "") + desc;
+                                            item.Overview = overview;
+                                        }
+
+                                        var pub = InvidiousApi.GetLong(r, "published");
+                                        DateTime? premiere = null;
+                                        int? year = null;
+                                        if (pub.HasValue)
+                                        {
+                                            var dt = DateTimeOffset.FromUnixTimeSeconds(pub.Value).UtcDateTime;
+                                            premiere = dt;
+                                            year = dt.Year;
+                                            item.PremiereDate = dt;
+                                            item.DateCreated = dt;
+                                            item.ProductionYear = dt.Year;
+                                        }
+
+                                        var len = InvidiousApi.GetInt(r, "lengthSeconds");
+                                        long? ticks = null;
+                                        if (len > 0)
+                                        {
+                                            ticks = TimeSpan.FromSeconds(len.Value).Ticks;
+                                            item.RunTimeTicks = ticks;
+                                        }
+
+                                        MetaCache[item.Id] = new VideoMeta(overview, premiere, year, ticks, DateTime.UtcNow);
+                                    }
+                                    finally { sem.Release(); }
+                                })).ConfigureAwait(false);
                             }
-                            catch { }
-                            finally { sem.Release(); }
-                        })).ConfigureAwait(false);
+                            catch (OperationCanceledException) { }
+
+                            EvictExpiredMetaCache();
+                        }
 
                         foreach (var item in batch)
                         {
                             item.Name = $"{(startIndex + items.Count + 1):D3} | {item.Name}";
                             items.Add(item);
                         }
-                        if (tempItems.Count < 10) break;
+
+                        if (items.Count >= limit) break;
+                        if (batch.Count == 0 && !seeking) break;
+                        if (currentPage > 1 && lastPageSize < firstPageSize) break;
                         currentPage++;
                     }
 
                     if (items.Count == 0 && startIndex == 0)
                         return Msg(items, "No results found.");
 
-                    return new ChannelItemResult { Items = items, TotalRecordCount = items.Count == limit ? startIndex + items.Count + 20 : startIndex + items.Count };
+                    int total = (items.Count == limit && lastPageSize > 0)
+                        ? startIndex + items.Count + 1
+                        : startIndex + items.Count;
+
+                    return new ChannelItemResult { Items = items, TotalRecordCount = total };
                 }
-                return new ChannelItemResult { Items = items, TotalRecordCount = items.Count };
+
+                return new ChannelItemResult { Items = items };
             }
-            catch (Exception ex) { return Msg(items, "MAIN ERROR: " + ex.Message); }
+            catch (Exception ex)
+            {
+                return Msg(items, $"ERROR: {ex.Message}");
+            }
         }
 
-        // ═══════════════════════════════════════════════════════════
-        // VIDEO LIST PARSING
-        // ═══════════════════════════════════════════════════════════
-        private List<ChannelItemInfo> ExtractVideos(JsonDocument doc, string baseUrl)
+        private static List<ChannelItemInfo> ExtractVideos(JsonDocument doc)
         {
             var list = new List<ChannelItemInfo>();
             JsonElement arr = default;
             bool found = false;
-            if (doc.RootElement.ValueKind == JsonValueKind.Array) { arr = doc.RootElement; found = true; }
-            else if (doc.RootElement.TryGetProperty("videos", out var v) && v.ValueKind == JsonValueKind.Array) { arr = v; found = true; }
+
+            if (doc.RootElement.ValueKind == JsonValueKind.Array)
+            {
+                arr = doc.RootElement;
+                found = true;
+            }
+            else if (doc.RootElement.TryGetProperty("videos", out var v) && v.ValueKind == JsonValueKind.Array)
+            {
+                arr = v;
+                found = true;
+            }
             if (!found) return list;
 
             foreach (var el in arr.EnumerateArray())
             {
                 var videoId = InvidiousApi.GetString(el, "videoId");
                 if (string.IsNullOrWhiteSpace(videoId)) continue;
+
                 var title = InvidiousApi.GetString(el, "title") ?? "Untitled";
                 var author = InvidiousApi.GetString(el, "author") ?? "Unknown";
                 var pubUnix = InvidiousApi.GetLong(el, "published");
-                DateTime? premiere = pubUnix.HasValue ? DateTimeOffset.FromUnixTimeSeconds(pubUnix.Value).UtcDateTime : null;
+                DateTime? premiere = pubUnix.HasValue
+                    ? DateTimeOffset.FromUnixTimeSeconds(pubUnix.Value).UtcDateTime
+                    : null;
                 var len = InvidiousApi.GetInt(el, "lengthSeconds");
+
+                var thumb = BestVideoThumbnail(el, videoId!);
 
                 list.Add(new ChannelItemInfo
                 {
@@ -185,353 +330,292 @@ namespace Emby.InvidiousPlugin
                     Id = videoId,
                     Type = ChannelItemType.Media,
                     MediaType = ChannelMediaType.Video,
-                    ImageUrl = $"https://i.ytimg.com/vi/{videoId}/mqdefault.jpg"
+                    ImageUrl = thumb
                 });
             }
             return list;
         }
 
-        // ═══════════════════════════════════════════════════════════
-        // PLAYBACK: MEDIA SOURCE SELECTION
-        // ═══════════════════════════════════════════════════════════
+        private static string BestVideoThumbnail(JsonElement el, string videoId)
+        {
+            if (el.TryGetProperty("videoThumbnails", out var thumbArr) && thumbArr.ValueKind == JsonValueKind.Array)
+            {
+                string? bestUrl = null;
+                int bestWidth = 0;
+                foreach (var t in thumbArr.EnumerateArray())
+                {
+                    var url = InvidiousApi.GetString(t, "url");
+                    if (string.IsNullOrEmpty(url)) continue;
+                    url = InvidiousApi.RewriteThumbnailUrl(url);
+                    var w = InvidiousApi.GetInt(t, "width") ?? 0;
+                    if (w >= bestWidth) { bestWidth = w; bestUrl = url; }
+                }
+                if (!string.IsNullOrEmpty(bestUrl)) return bestUrl!;
+            }
+
+            return $"https://i.ytimg.com/vi/{videoId}/hqdefault.jpg";
+        }
+
         public async Task<IEnumerable<MediaSourceInfo>> GetChannelItemMediaInfo(string id, CancellationToken cancellationToken)
         {
-            var config = Plugin.Instance!.Options;
+            var plugin = Plugin.Instance;
+            if (plugin == null) return new List<MediaSourceInfo>();
+
+            var config = plugin.Options;
             var baseUrl = (config.InvidiousUrl ?? "").TrimEnd('/');
             var headers = InvidiousApi.BuildPlaybackHeaders(baseUrl);
             var sources = new List<MediaSourceInfo>();
 
             try
             {
-                // Kill FFmpeg from previously playing videos
-                MuxHelper.KillOtherVideos(id);
-
-                var api = new InvidiousApi();
-                using var videoDoc = await api.GetVideoAsync(baseUrl, id, cancellationToken).ConfigureAwait(false);
+                using var videoDoc = await InvidiousApi.GetVideoAsync(baseUrl, id, cancellationToken).ConfigureAwait(false);
                 var root = videoDoc.RootElement;
 
-                // ── Find best adaptive video stream (h264 + vp9 for 4K) ──
-                string? bestVideoItag = null;
-                string? bestVideoUrl = null;
-                int bestVideoHeight = 0;
-                string? bestVideoLabel = null;
-                bool bestVideoIsVp9 = false;
-
-                string? vid1080Itag = null;
-                string? vid1080Url = null;
-                string? vid1080Label = null;
-                bool vid1080IsVp9 = false;
-
-                // ── Find best original audio stream (mp4/m4a only) ──
-                string? bestAudioItag = null;
-                string? bestAudioUrl = null;
-                int bestAudioBitrate = 0;
-                bool bestAudioIsOriginal = false;
-
-                if (root.TryGetProperty("adaptiveFormats", out var adaptive) && adaptive.ValueKind == JsonValueKind.Array)
-                {
-                    foreach (var el in adaptive.EnumerateArray())
-                    {
-                        var type = InvidiousApi.GetString(el, "type") ?? "";
-                        var itag = InvidiousApi.GetString(el, "itag");
-                        var url = InvidiousApi.GetString(el, "url");
-                        if (string.IsNullOrEmpty(itag)) continue;
-
-                        // Video: h264 (mp4+avc1) OR vp9 (webm+vp9) for 4K support
-                        bool isH264 = type.StartsWith("video/mp4") && type.Contains("avc1");
-                        bool isVp9 = type.StartsWith("video/webm") && type.Contains("vp9");
-                        if (isH264 || isVp9)
-                        {
-                            int h = ParseHeightFromElement(el);
-                            if (h <= 0) continue;
-                            var label = InvidiousApi.GetString(el, "qualityLabel") ?? $"{h}p";
-
-                            // Best overall: higher height wins; at same height prefer h264
-                            if (h > bestVideoHeight || (h == bestVideoHeight && isH264 && bestVideoIsVp9))
-                            {
-                                bestVideoHeight = h;
-                                bestVideoItag = itag;
-                                bestVideoUrl = url;
-                                bestVideoLabel = label;
-                                bestVideoIsVp9 = isVp9;
-                            }
-
-                            // Track 1080p separately: prefer h264 over vp9
-                            if (h == 1080 && (vid1080Itag == null || (isH264 && vid1080IsVp9)))
-                            {
-                                vid1080Itag = itag;
-                                vid1080Url = url;
-                                vid1080Label = label;
-                                vid1080IsVp9 = isVp9;
-                            }
-                        }
-
-                        // Audio: prefer original language over AI-dubbed
-                        if (type.StartsWith("audio/mp4") || type.StartsWith("audio/m4a"))
-                        {
-                            int br = InvidiousApi.GetInt(el, "bitrate") ?? 0;
-                            bool isOriginal = false;
-
-                            if (el.TryGetProperty("audioTrack", out var audioTrack) && audioTrack.ValueKind == JsonValueKind.Object)
-                            {
-                                if (audioTrack.TryGetProperty("audioIsDefault", out var defProp))
-                                {
-                                    if (defProp.ValueKind == JsonValueKind.True)
-                                        isOriginal = true;
-                                    else if (defProp.ValueKind == JsonValueKind.String)
-                                        isOriginal = defProp.GetString()?.Equals("true", StringComparison.OrdinalIgnoreCase) == true;
-                                }
-                            }
-                            else
-                            {
-                                isOriginal = true; // No audioTrack info → treat as original
-                            }
-
-                            bool shouldReplace = false;
-                            if (isOriginal && !bestAudioIsOriginal) shouldReplace = true;
-                            else if (isOriginal == bestAudioIsOriginal && br > bestAudioBitrate) shouldReplace = true;
-
-                            if (shouldReplace)
-                            {
-                                bestAudioBitrate = br;
-                                bestAudioItag = itag;
-                                bestAudioUrl = url;
-                                bestAudioIsOriginal = isOriginal;
-                            }
-                        }
-                    }
-                }
-
-                // ── Collect ALL muxed streams (formatStreams) ──
-                var muxedStreams = new List<(string itag, int height, string label)>();
-                if (root.TryGetProperty("formatStreams", out var fmtArr) && fmtArr.ValueKind == JsonValueKind.Array)
-                {
-                    foreach (var el in fmtArr.EnumerateArray())
-                    {
-                        if (!(InvidiousApi.GetString(el, "container") ?? "").Contains("mp4", StringComparison.OrdinalIgnoreCase)) continue;
-                        var itag = InvidiousApi.GetString(el, "itag") ?? "";
-                        int h = ParseHeightFromElement(el);
-                        if (h == 0)
-                        {
-                            if (itag == "22") h = 720;
-                            else if (itag == "18") h = 480; // itag 18 is actually 480p, not 360p
-                        }
-                        if (h > 0)
-                        {
-                            var label = InvidiousApi.GetString(el, "qualityLabel") ?? $"{h}p";
-                            // Fix mislabeled 360p → 480p (itag 18 is 480p)
-                            if (itag == "18" && label.Contains("360")) label = "480p";
-                            muxedStreams.Add((itag, h, label));
-                        }
-                    }
-                }
+                var bestVideo = FindBestAdaptiveVideo(root);
+                var bestAudio = FindBestAudio(root);
+                var muxedStreams = ExtractMuxedStreams(root);
 
                 int maxMuxedHeight = muxedStreams.Count > 0 ? muxedStreams.Max(m => m.height) : 0;
 
-                // ── Build list of HLS qualities (highest + 1080p if available) ──
-                // Only ONE gets muxed per call. When user switches source, Emby
-                // calls this method again → the cached one is skipped, next gets muxed.
+                string audioMuxUrl = !string.IsNullOrEmpty(bestAudio.url)
+                    ? bestAudio.url!
+                    : $"{baseUrl}/latest_version?id={id}&itag={bestAudio.itag}&local=true";
+
                 var hlsQualities = new List<(string itag, string? url, int height, string label, bool isVp9)>();
-                if (bestVideoItag != null && bestAudioItag != null && bestVideoHeight > maxMuxedHeight)
+                bool canMux = bestVideo.itag != null && (bestAudio.url != null || bestAudio.itag != null);
+                if (canMux && (bestVideo.height >= 1080 || bestVideo.height > maxMuxedHeight))
                 {
-                    hlsQualities.Add((bestVideoItag, bestVideoUrl, bestVideoHeight, bestVideoLabel ?? $"{bestVideoHeight}p", bestVideoIsVp9));
-                    if (bestVideoHeight > 1080 && vid1080Itag != null)
-                        hlsQualities.Add((vid1080Itag!, vid1080Url, 1080, vid1080Label ?? "1080p", vid1080IsVp9));
+                    hlsQualities.Add((bestVideo.itag!, bestVideo.url, bestVideo.height, bestVideo.label ?? $"{bestVideo.height}p", bestVideo.isVp9));
+                    if (bestVideo.height > 1080 && bestVideo.fallback1080Itag != null)
+                        hlsQualities.Add((bestVideo.fallback1080Itag!, bestVideo.fallback1080Url, 1080, bestVideo.fallback1080Label ?? "1080p", bestVideo.fallback1080IsVp9));
                 }
 
-                bool alreadyMuxedOne = false;
                 foreach (var q in hlsQualities.OrderByDescending(x => x.height))
                 {
-                    var expectedPath = MuxHelper.GetExpectedPlaybackPath(id, q.height);
                     var cachedStream = MuxHelper.GetCachedStreamPath(id, q.height);
                     string videoCodec = q.isVp9 ? "vp9" : "h264";
+                    int w = HeightToWidth(q.height);
+
+                    string videoMuxUrl = !string.IsNullOrEmpty(q.url)
+                        ? q.url!
+                        : $"{baseUrl}/latest_version?id={id}&itag={q.itag}&local=true";
 
                     if (cachedStream != null)
                     {
-                        int w = q.height switch { 2160 => 3840, 1440 => 2560, 1080 => 1920, 720 => 1280, _ => (int)(q.height * 16.0 / 9) };
-                        sources.Add(new MediaSourceInfo
-                        {
-                            Id = $"{id}_hls_{q.height}p",
-                            Name = $"🎬 {q.label} (HD)",
-                            Path = cachedStream,
-                            Protocol = MediaProtocol.File,
-                            Container = "hls",
-                            IsRemote = false,
-                            SupportsDirectPlay = false,
-                            SupportsDirectStream = true,
-                            SupportsTranscoding = true,
-                            DefaultAudioStreamIndex = 1,
-                            MediaStreams = new List<MediaStream>
-                            {
-                                new MediaStream { Type = MediaStreamType.Video, Index = 0, Codec = videoCodec, Width = w, Height = q.height, IsDefault = true },
-                                new MediaStream { Type = MediaStreamType.Audio, Index = 1, Codec = "aac", Channels = 2, SampleRate = 44100, IsDefault = true }
-                            }
-                        });
-                    }
-                    else if (!alreadyMuxedOne)
-                    {
-                        string fVid, fAud;
-                        if (!string.IsNullOrEmpty(q.url) && !string.IsNullOrEmpty(bestAudioUrl))
-                        { fVid = q.url; fAud = bestAudioUrl; }
-                        else
-                        {
-                            var cb = InvidiousApi.GetCleanBaseUrl(baseUrl);
-                            fVid = $"{cb}/latest_version?id={id}&itag={q.itag}&local=true";
-                            fAud = $"{cb}/latest_version?id={id}&itag={bestAudioItag}&local=true";
-                        }
-
-                        var m3u8Path = await MuxHelper.MuxToHlsAsync(fVid, fAud, id, q.height, q.isVp9).ConfigureAwait(false);
-
-                        if (string.IsNullOrEmpty(m3u8Path) && !string.IsNullOrEmpty(q.url))
-                        {
-                            var cb = InvidiousApi.GetCleanBaseUrl(baseUrl);
-                            m3u8Path = await MuxHelper.MuxToHlsAsync(
-                                $"{cb}/latest_version?id={id}&itag={q.itag}&local=true",
-                                $"{cb}/latest_version?id={id}&itag={bestAudioItag}&local=true",
-                                id, q.height, q.isVp9
-                            ).ConfigureAwait(false);
-                        }
-
-                        if (!string.IsNullOrEmpty(m3u8Path) && File.Exists(m3u8Path))
-                        {
-                            // Mux succeeded → block further muxes this call
-                            alreadyMuxedOne = true;
-                            int w = q.height switch { 2160 => 3840, 1440 => 2560, 1080 => 1920, 720 => 1280, _ => (int)(q.height * 16.0 / 9) };
-                            sources.Add(new MediaSourceInfo
-                            {
-                                Id = $"{id}_hls_{q.height}p",
-                                Name = $"🎬 {q.label} (HD)",
-                                Path = m3u8Path,
-                                Protocol = MediaProtocol.File,
-                                Container = "hls",
-                                IsRemote = false,
-                                SupportsDirectPlay = false,
-                                SupportsDirectStream = true,
-                                SupportsTranscoding = true,
-                                DefaultAudioStreamIndex = 1,
-                                MediaStreams = new List<MediaStream>
-                                {
-                                    new MediaStream { Type = MediaStreamType.Video, Index = 0, Codec = videoCodec, Width = w, Height = q.height, IsDefault = true },
-                                    new MediaStream { Type = MediaStreamType.Audio, Index = 1, Codec = "aac", Channels = 2, SampleRate = 44100, IsDefault = true }
-                                }
-                            });
-                        }
+                        sources.Add(BuildHlsSource(id, q.height, w, q.label, videoCodec, cachedStream));
                     }
                     else
                     {
-                        int w = q.height switch { 2160 => 3840, 1440 => 2560, 1080 => 1920, 720 => 1280, _ => (int)(q.height * 16.0 / 9) };
-                        sources.Add(new MediaSourceInfo
-                        {
-                            Id = $"{id}_hls_{q.height}p",
-                            Name = $"🎬 {q.label} (HD)",
-                            Path = expectedPath,
-                            Protocol = MediaProtocol.File,
-                            Container = "hls",
-                            IsRemote = false,
-                            SupportsDirectPlay = false,
-                            SupportsDirectStream = true,
-                            SupportsTranscoding = true,
-                            DefaultAudioStreamIndex = 1,
-                            MediaStreams = new List<MediaStream>
-                            {
-                                new MediaStream { Type = MediaStreamType.Video, Index = 0, Codec = videoCodec, Width = w, Height = q.height, IsDefault = true },
-                                new MediaStream { Type = MediaStreamType.Audio, Index = 1, Codec = "aac", Channels = 2, SampleRate = 44100, IsDefault = true }
-                            }
-                        });
+                        var playbackPath = MuxHelper.PreparePlaybackPath(id, q.height);
+                        var capturedVideoUrl = videoMuxUrl;
+                        var capturedAudioUrl = audioMuxUrl;
+                        var capturedId = id;
+                        var capturedHeight = q.height;
+                        var capturedIsVp9 = q.isVp9;
+                        _ = Task.Run(() => MuxHelper.MuxToHlsAsync(
+                            capturedVideoUrl, capturedAudioUrl,
+                            capturedId, capturedHeight, capturedIsVp9));
+                        sources.Add(BuildHlsSource(id, q.height, w, q.label, videoCodec, playbackPath));
                     }
                 }
 
-                // ── Direct play for all muxed streams (480p, 720p, etc.) ──
                 foreach (var m in muxedStreams.OrderByDescending(x => x.height))
                 {
-                    sources.Add(new MediaSourceInfo
-                    {
-                        Id = $"{id}_direct_{m.height}p",
-                        Name = $"📺 {m.label} MP4 (Direct)",
-                        Path = $"{baseUrl}/latest_version?id={id}&itag={m.itag}&local=true",
-                        Protocol = MediaProtocol.Http,
-                        Container = "mp4",
-                        IsRemote = true,
-                        RequiredHttpHeaders = headers,
-                        SupportsDirectPlay = false,
-                        SupportsDirectStream = true,
-                        SupportsTranscoding = true,
-                    });
+                    sources.Add(BuildDirectSource(id, m.height, m.label, m.itag, baseUrl, headers));
                 }
 
-                // ── Fallback if nothing found ──
                 if (sources.Count == 0)
                 {
-                    sources.Add(new MediaSourceInfo
-                    {
-                        Id = $"{id}_fallback",
-                        Name = "📺 SD MP4 (Fallback)",
-                        Path = $"{baseUrl}/latest_version?id={id}&itag=18&local=true",
-                        Protocol = MediaProtocol.Http,
-                        Container = "mp4",
-                        IsRemote = true,
-                        RequiredHttpHeaders = headers,
-                        SupportsDirectPlay = false,
-                        SupportsDirectStream = true,
-                        SupportsTranscoding = true,
-                    });
+                    sources.Add(BuildDirectSource(id, 480, "SD Fallback", Itag480p, baseUrl, headers));
                 }
             }
+            catch (OperationCanceledException) { }
             catch
             {
-                sources.Add(new MediaSourceInfo
-                {
-                    Id = id,
-                    Name = "Invidious (Fallback)",
-                    Path = $"{baseUrl}/latest_version?id={id}&itag=18&local=true",
-                    Protocol = MediaProtocol.Http,
-                    Container = "mp4",
-                    IsRemote = true,
-                    RequiredHttpHeaders = headers,
-                    SupportsDirectPlay = false,
-                    SupportsDirectStream = true,
-                    SupportsTranscoding = true,
-                });
+                sources.Add(BuildDirectSource(id, 480, "Invidious (Fallback)", Itag480p, baseUrl, headers));
             }
 
             return sources;
         }
 
-        // ═══════════════════════════════════════════════════════════
-        // HELPERS
-        // ═══════════════════════════════════════════════════════════
+        private record AdaptiveVideoResult(
+            string? itag, string? url, int height, string? label, bool isVp9,
+            string? fallback1080Itag, string? fallback1080Url, string? fallback1080Label, bool fallback1080IsVp9);
 
-        /// <summary>
-        /// Parses video height from Invidious JSON element.
-        /// Tries: "size" ("1920x1080") → "resolution" ("1080p") → "qualityLabel" ("1080p60")
-        /// </summary>
+        private record AdaptiveAudioResult(string? itag, string? url, int bitrate);
+
+        private static AdaptiveVideoResult FindBestAdaptiveVideo(JsonElement root)
+        {
+            string? bestItag = null, bestUrl = null, bestLabel = null;
+            int bestHeight = 0;
+            bool bestIsVp9 = false;
+
+            string? fb1080Itag = null, fb1080Url = null, fb1080Label = null;
+            bool fb1080IsVp9 = false;
+
+            if (!root.TryGetProperty("adaptiveFormats", out var adaptive) || adaptive.ValueKind != JsonValueKind.Array)
+                return new AdaptiveVideoResult(null, null, 0, null, false, null, null, null, false);
+
+            foreach (var el in adaptive.EnumerateArray())
+            {
+                var type = InvidiousApi.GetString(el, "type") ?? "";
+                var itag = InvidiousApi.GetString(el, "itag");
+                var url = InvidiousApi.GetString(el, "url");
+                if (string.IsNullOrEmpty(itag)) continue;
+
+                bool isH264 = type.StartsWith("video/mp4") && type.Contains("avc1");
+                bool isVp9 = type.StartsWith("video/webm") && type.Contains("vp9");
+                if (!isH264 && !isVp9) continue;
+
+                int h = ParseHeightFromElement(el);
+                if (h <= 0) continue;
+                var label = InvidiousApi.GetString(el, "qualityLabel") ?? $"{h}p";
+
+                if (h > bestHeight || (h == bestHeight && isH264 && bestIsVp9))
+                {
+                    bestHeight = h; bestItag = itag; bestUrl = url; bestLabel = label; bestIsVp9 = isVp9;
+                }
+                if (h == 1080 && (fb1080Itag == null || (isH264 && fb1080IsVp9)))
+                {
+                    fb1080Itag = itag; fb1080Url = url; fb1080Label = label; fb1080IsVp9 = isVp9;
+                }
+            }
+
+            return new AdaptiveVideoResult(bestItag, bestUrl, bestHeight, bestLabel, bestIsVp9,
+                fb1080Itag, fb1080Url, fb1080Label, fb1080IsVp9);
+        }
+
+        private static AdaptiveAudioResult FindBestAudio(JsonElement root)
+        {
+            string? bestItag = null, bestUrl = null;
+            int bestBitrate = 0;
+            bool bestIsOriginal = false;
+
+            if (!root.TryGetProperty("adaptiveFormats", out var adaptive) || adaptive.ValueKind != JsonValueKind.Array)
+                return new AdaptiveAudioResult(null, null, 0);
+
+            foreach (var el in adaptive.EnumerateArray())
+            {
+                var type = InvidiousApi.GetString(el, "type") ?? "";
+                if (!type.StartsWith("audio/mp4") && !type.StartsWith("audio/m4a")) continue;
+
+                var itag = InvidiousApi.GetString(el, "itag");
+                var url = InvidiousApi.GetString(el, "url");
+                int br = InvidiousApi.GetInt(el, "bitrate") ?? 0;
+
+                bool isOriginal = true;
+                if (el.TryGetProperty("audioTrack", out var audioTrack) && audioTrack.ValueKind == JsonValueKind.Object)
+                {
+                    if (audioTrack.TryGetProperty("audioIsDefault", out var defProp))
+                    {
+                        isOriginal = defProp.ValueKind == JsonValueKind.True ||
+                            (defProp.ValueKind == JsonValueKind.String &&
+                             "true".Equals(defProp.GetString(), StringComparison.OrdinalIgnoreCase));
+                    }
+                }
+
+                bool shouldReplace = (isOriginal && !bestIsOriginal) ||
+                                     (isOriginal == bestIsOriginal && br > bestBitrate);
+                if (shouldReplace)
+                {
+                    bestBitrate = br; bestItag = itag; bestUrl = url; bestIsOriginal = isOriginal;
+                }
+            }
+
+            return new AdaptiveAudioResult(bestItag, bestUrl, bestBitrate);
+        }
+
+        private static List<(string itag, int height, string label)> ExtractMuxedStreams(JsonElement root)
+        {
+            var result = new List<(string itag, int height, string label)>();
+            if (!root.TryGetProperty("formatStreams", out var fmtArr) || fmtArr.ValueKind != JsonValueKind.Array)
+                return result;
+
+            foreach (var el in fmtArr.EnumerateArray())
+            {
+                if (!(InvidiousApi.GetString(el, "container") ?? "").Contains("mp4", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                var itag = InvidiousApi.GetString(el, "itag") ?? "";
+                int h = ParseHeightFromElement(el);
+                if (h == 0)
+                {
+                    if (itag == Itag720p) h = 720;
+                    else if (itag == Itag480p) h = 480;
+                }
+                if (h > 0)
+                {
+                    var label = InvidiousApi.GetString(el, "qualityLabel") ?? $"{h}p";
+                    if (itag == Itag480p && label.Contains("360")) label = "480p";
+                    result.Add((itag, h, label));
+                }
+            }
+            return result;
+        }
+
+        private static MediaSourceInfo BuildHlsSource(
+            string videoId, int height, int width, string label, string codec, string path)
+        {
+            return new MediaSourceInfo
+            {
+                Id = $"{videoId}_hls_{height}p",
+                Name = $"{label} (HD)",
+                Path = path,
+                Protocol = MediaProtocol.File,
+                Container = "hls",
+                IsRemote = false,
+                SupportsDirectPlay = false,
+                SupportsDirectStream = true,
+                SupportsTranscoding = true,
+                DefaultAudioStreamIndex = 1,
+                MediaStreams = new List<MediaStream>
+                {
+                    new MediaStream { Type = MediaStreamType.Video, Index = 0, Codec = codec, Width = width, Height = height, IsDefault = true },
+                    new MediaStream { Type = MediaStreamType.Audio, Index = 1, Codec = "aac", Channels = 2, SampleRate = 44100, IsDefault = true }
+                }
+            };
+        }
+
+        private static MediaSourceInfo BuildDirectSource(
+            string videoId, int height, string label, string itag,
+            string baseUrl, Dictionary<string, string> headers)
+        {
+            return new MediaSourceInfo
+            {
+                Id = $"{videoId}_direct_{height}p",
+                Name = $"{label} MP4",
+                Path = $"{baseUrl}/latest_version?id={videoId}&itag={itag}&local=true",
+                Protocol = MediaProtocol.Http,
+                Container = "mp4",
+                IsRemote = true,
+                RequiredHttpHeaders = headers,
+                SupportsDirectPlay = false,
+                SupportsDirectStream = true,
+                SupportsTranscoding = true,
+            };
+        }
+
+        private static int HeightToWidth(int height) => height switch
+        {
+            2160 => 3840,
+            1440 => 2560,
+            1080 => 1920,
+            720 => 1280,
+            480 => 854,
+            _ => (int)(height * 16.0 / 9)
+        };
+
         private static int ParseHeightFromElement(JsonElement el)
         {
-            // Try "size": "1920x1080"
             var size = InvidiousApi.GetString(el, "size");
             if (!string.IsNullOrEmpty(size))
             {
                 var idx = size.IndexOf('x');
-                if (idx > 0 && int.TryParse(size.Substring(idx + 1), out var h))
-                    return h;
+                if (idx > 0 && int.TryParse(size.Substring(idx + 1), out var h)) return h;
             }
-
-            // Try "resolution": "1080p"
             var res = InvidiousApi.GetString(el, "resolution");
-            if (!string.IsNullOrEmpty(res))
-            {
-                var n = ExtractLeadingNumber(res);
-                if (n > 0) return n;
-            }
-
-            // Try "qualityLabel": "1080p60"
+            if (!string.IsNullOrEmpty(res)) { var n = ExtractLeadingNumber(res); if (n > 0) return n; }
             var ql = InvidiousApi.GetString(el, "qualityLabel");
-            if (!string.IsNullOrEmpty(ql))
-            {
-                var n = ExtractLeadingNumber(ql);
-                if (n > 0) return n;
-            }
-
+            if (!string.IsNullOrEmpty(ql)) { var n = ExtractLeadingNumber(ql); if (n > 0) return n; }
             return 0;
         }
 
@@ -539,18 +623,25 @@ namespace Emby.InvidiousPlugin
         {
             int i = 0;
             while (i < s.Length && char.IsDigit(s[i])) i++;
-            return i > 0 && int.TryParse(s.Substring(0, i), out var val) ? val : 0;
+            return i > 0 && int.TryParse(s.Substring(0, i), out var v) ? v : 0;
         }
 
-        public IEnumerable<ImageType> GetSupportedChannelImages() => new List<ImageType> { ImageType.Thumb, ImageType.Primary };
+        private static int ClampVideos(int val) => Math.Clamp(val, 1, 150);
+
+        public IEnumerable<ImageType> GetSupportedChannelImages() =>
+            new List<ImageType> { ImageType.Thumb, ImageType.Primary };
 
         public Task<DynamicImageResponse> GetChannelImage(ImageType type, CancellationToken cancellationToken)
         {
             var t = GetType();
             var stream = t.Assembly.GetManifestResourceStream(t.Namespace + ".thumb.png");
-            return Task.FromResult(stream != null
-                ? new DynamicImageResponse { Format = ImageFormat.Png, Stream = stream }
-                : null!);
+            var response = new DynamicImageResponse();
+            if (stream != null)
+            {
+                response.Format = ImageFormat.Png;
+                response.Stream = stream;
+            }
+            return Task.FromResult(response);
         }
 
         private static ChannelItemResult Msg(List<ChannelItemInfo> items, string msg)
