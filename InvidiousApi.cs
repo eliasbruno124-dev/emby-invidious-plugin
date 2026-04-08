@@ -169,10 +169,21 @@ namespace Emby.InvidiousPlugin
             return GetJsonAsync(baseUrl, "api/v1/popular", ct);
         }
 
-        public static Task<JsonDocument> GetChannelVideosAsync(string baseUrl, string channelId, int page, CancellationToken ct)
+        public static Task<JsonDocument> GetChannelVideosAsync(string baseUrl, string channelId, int page, CancellationToken ct, string sortBy = "newest")
         {
             var id = Uri.EscapeDataString(channelId ?? "");
-            return GetJsonAsync(baseUrl, $"api/v1/channels/{id}/videos?page={page}&sort_by=newest", ct);
+            var sort = NormalizeSortBy(sortBy);
+            return GetJsonAsync(baseUrl, $"api/v1/channels/{id}/videos?page={page}&sort_by={sort}", ct);
+        }
+
+        private static string NormalizeSortBy(string sortBy)
+        {
+            return (sortBy ?? "").Trim().ToLowerInvariant() switch
+            {
+                "oldest" => "oldest",
+                "popular" => "popular",
+                _ => "newest"
+            };
         }
 
         public static Task<JsonDocument> GetPlaylistVideosAsync(string baseUrl, string playlistId, int page, CancellationToken ct)

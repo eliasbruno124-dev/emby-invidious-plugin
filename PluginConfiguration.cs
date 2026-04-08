@@ -51,6 +51,16 @@ namespace Emby.InvidiousPlugin
         public string TrendingRegion { get; set; } = "DE";
 
         // ─────────────────────────────────────────────────────────────────────
+        // SORTING
+        // ─────────────────────────────────────────────────────────────────────
+
+        [DisplayName("Sort Channel Videos By")]
+        [Description(
+            "How to sort videos when browsing a channel.\n" +
+            "Options: newest, oldest, popular")]
+        public string ChannelSortBy { get; set; } = "newest";
+
+        // ─────────────────────────────────────────────────────────────────────
         // LIMITS
         // ─────────────────────────────────────────────────────────────────────
 
