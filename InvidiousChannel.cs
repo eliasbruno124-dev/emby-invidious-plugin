@@ -36,7 +36,7 @@ namespace Emby.InvidiousPlugin
 
         private record VideoMeta(string? Overview, DateTime? Premiere, int? Year, long? RuntimeTicks, DateTime CachedAt);
         private static readonly ConcurrentDictionary<string, VideoMeta> MetaCache = new();
-        private static readonly TimeSpan MetaCacheTtl = TimeSpan.FromHours(6);
+        private static readonly TimeSpan MetaCacheTtl = TimeSpan.FromDays(365);
 
         public ChannelFeatures GetChannelFeatures()
         {
@@ -191,8 +191,7 @@ namespace Emby.InvidiousPlugin
                         var uncached = new List<ChannelItemInfo>();
                         foreach (var item in batch)
                         {
-                            if (MetaCache.TryGetValue(item.Id, out var cached)
-                                && (DateTime.UtcNow - cached.CachedAt) < MetaCacheTtl)
+                            if (MetaCache.TryGetValue(item.Id, out var cached))
                             {
                                 if (!string.IsNullOrEmpty(cached.Overview)) item.Overview = cached.Overview;
                                 if (cached.Premiere.HasValue) { item.PremiereDate = cached.Premiere; item.DateCreated = cached.Premiere; }
@@ -213,14 +212,18 @@ namespace Emby.InvidiousPlugin
                                 enrichCts.CancelAfter(TimeSpan.FromSeconds(15));
                                 var enrichToken = enrichCts.Token;
 
-                                using var sem = new SemaphoreSlim(10);
+                                using var sem = new SemaphoreSlim(4);
                                 await Task.WhenAll(uncached.Select(async item =>
                                 {
                                     await sem.WaitAsync(enrichToken).ConfigureAwait(false);
                                     try
                                     {
                                         using var vDoc = await InvidiousApi.TryGetVideoAsync(baseUrl, item.Id, enrichToken).ConfigureAwait(false);
-                                        if (vDoc == null) return;
+                                        if (vDoc == null)
+                                        {
+                                            MetaCache[item.Id] = new VideoMeta(null, null, null, null, DateTime.UtcNow);
+                                            return;
+                                        }
                                         var r = vDoc.RootElement;
 
                                         var desc = InvidiousApi.GetString(r, "description");
