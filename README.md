@@ -2,7 +2,16 @@
 
 A powerful, privacy-friendly [Invidious](https://github.com/iv-org/invidious/) plugin for [Emby](https://emby.media/) that operates entirely without Google API keys. It uses an Invidious instance (ideally self-hosted) to seamlessly integrate channels, playlists, search queries, and trending content directly into your Emby dashboard — with full 4K/1080p HLS muxing, Shorts support, and livestream playback.
 
-Plugin Screenshot !\[main site](https://github.com/user-attachments/assets/a9bc0d27-f65f-4f8f-b06a-cf026e86c074)!\[overview](https://github.com/user-attachments/assets/5c03fd67-263f-48ed-b26d-794fa84c20d5)!\[channel](https://github.com/user-attachments/assets/85dc2686-13b6-4efe-9e4f-cc3bd9e24370)
+Plugin Screenshot
+
+<img width="1919" height="533" alt="Screenshot 2026-04-09 140615" src="https://github.com/user-attachments/assets/b4a0082e-61f2-4abd-8598-856d32774a8a" />
+
+<img width="1919" height="306" alt="overview" src="https://github.com/user-attachments/assets/47a8fb20-2496-45f9-845c-cd534883360b" />
+
+<img width="1891" height="716" alt="Trending" src="https://github.com/user-attachments/assets/5d6af148-c007-4faa-9672-b1ab2720a3dd" />
+
+<img width="1532" height="353" alt="4k" src="https://github.com/user-attachments/assets/b8f1e9e5-0084-4031-8103-6eaf99adf926" />
+
 
 ## ✨ Features
 
@@ -57,7 +66,9 @@ Plugin Screenshot !\[main site](https://github.com/user-attachments/assets/a9bc0
 
 ## ⚙️ Configuration
 
-Settings Screenshot !\[plugin](https://github.com/user-attachments/assets/d4ad03fa-a2e2-4dfe-99d2-5810c7aa1c05)!\[plugin settings](https://github.com/user-attachments/assets/43b2364a-8966-494f-acd3-431850dcc35b)
+Settings Screenshot 
+
+<img width="635" height="847" alt="settings" src="https://github.com/user-attachments/assets/e6d2159c-cccc-470f-aa9d-db0d142ceceb" />
 
 Go to your Emby Dashboard and open the "Invidious" plugin settings.
 
@@ -80,7 +91,7 @@ Go to your Emby Dashboard and open the "Invidious" plugin settings.
 |Setting|Default|Description|
 |-|-|-|
 |**Show Trending**|✅ On|Show a "Trending" folder with trending and popular videos|
-|**Trending Region**|`DE`|ISO 3166-1 country code (e.g. `DE`, `US`, `AT`, `CH`, `GB`, `FR`)|
+|**Trending Region**|`US`|ISO 3166-1 country code (e.g. `DE`, `US`, `AT`, `CH`, `GB`, `FR`)|
 
 ### Sorting
 
