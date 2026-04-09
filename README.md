@@ -1,69 +1,151 @@
 # 📺 Emby Invidious Plugin
 
-A powerful, privacy-friendly [Invidious](https://github.com/iv-org/invidious/) plugin for [Emby](https://emby.media/) that operates entirely without Google API keys. It uses an Invidious instance (ideally self-hosted) to seamlessly integrate channels, playlists, and search queries directly into your Emby dashboard.
+A powerful, privacy-friendly [Invidious](https://github.com/iv-org/invidious/) plugin for [Emby](https://emby.media/) that operates entirely without Google API keys. It uses an Invidious instance (ideally self-hosted) to seamlessly integrate channels, playlists, search queries, and trending content directly into your Emby dashboard — with full 4K/1080p HLS muxing, Shorts support, and livestream playback.
 
-Plugin Screenshot <img width="1918" height="867" alt="main site" src="https://github.com/user-attachments/assets/a9bc0d27-f65f-4f8f-b06a-cf026e86c074" /><img width="1918" height="875" alt="overview" src="https://github.com/user-attachments/assets/5c03fd67-263f-48ed-b26d-794fa84c20d5" /><img width="1918" height="867" alt="channel" src="https://github.com/user-attachments/assets/85dc2686-13b6-4efe-9e4f-cc3bd9e24370" />
+Plugin Screenshot !\[main site](https://github.com/user-attachments/assets/a9bc0d27-f65f-4f8f-b06a-cf026e86c074)!\[overview](https://github.com/user-attachments/assets/5c03fd67-263f-48ed-b26d-794fa84c20d5)!\[channel](https://github.com/user-attachments/assets/85dc2686-13b6-4efe-9e4f-cc3bd9e24370)
 
 ## ✨ Features
+
+### Core
 
 * **🛡️ 100% Privacy:** No Google trackers, no API keys required. Everything runs locally through your Invidious instance.
 * **🔄 Seamless Playlist Syncing:** Log into your Invidious account and create a **public playlist**. Add its `PL...` ID to this plugin. Any video you add to that playlist via Invidious will automatically sync to your Emby dashboard!
 * **🎯 Smart "@" Input:** A single, clean text field for all your content! Type `@GitHub` for channels, `PL123...` for playlists, or regular words for search queries.
 * **🖼️ Real Profile Pictures:** The plugin automatically fetches high-resolution channel avatars and playlist covers for the main menu.
 * **⏯️ "Continue Watching" Support:** Videos are internally declared as episodes. Emby perfectly remembers your exact progress (green progress bar) and displays unfinished videos on your home screen.
-* **🚀 Direct MP4 Playback:** Silently extracts the pure MP4 stream in the background. This guarantees instant, error-free playback on *any* Smart TV, smartphone, or browser.
 
----
+### Video Quality \& Playback
+
+* **🎬 4K \& 1080p HLS Muxing:** Automatically muxes the best available adaptive video + audio streams into HLS via FFmpeg. Supports both H.264 and VP9 codecs.
+* **⚡ Simultaneous Multi-Quality:** Both 4K and 1080p are muxed together on first play. All quality options appear instantly on the video detail page.
+* **🚀 Smart Playback Start:** The plugin waits for the first HLS segments to be ready before returning the stream to Emby — no more "press play twice" errors.
+* **📼 Direct MP4 Fallback:** 720p and 480p streams are always available as direct MP4 playback — instant, no muxing required.
+* **💾 HLS Cache:** Muxed segments are cached on disk (configurable 0–30 days). Subsequent plays of the same video skip muxing entirely.
+
+### Discover
+
+* **🔥 Trending:** A live "Trending" folder combining Popular, Trending, Music, Gaming, and Movies — all deduplicated and fetched in parallel.
+* **🌍 Region Support:** Configure your country code (e.g. `DE`, `US`, `AT`) to get region-specific YouTube trends.
+
+### Shorts / Reels
+
+* **▶ Automatic Detection:** Shorts are detected via Invidious API flags (`isShort`, `genre`), video duration (≤ 3 minutes), and actual video dimensions (vertical aspect ratio).
+* **📱 Vertical Playback:** Shorts are served with correct vertical dimensions (e.g. `1080x1920`) so Emby does not stretch them to 16:9. Direct Play is preferred.
+
+### Livestreams
+
+* **🔴 Live Detection:** Videos with `liveNow: true` are automatically marked with a 🔴 LIVE prefix.
+* **📡 HLS \& DASH:** Livestreams are played via YouTube's native HLS manifest (or DASH as fallback) with `IsInfiniteStream = true`.
+
+### Sorting
+
+* **📊 Configurable Sort Order:** Sort channel videos by `newest`, `oldest`, or `popular` — configurable in plugin settings.
+
+\---
 
 ## 📥 Installation
 
-1. Download the latest `Emby.InvidiousPlugin.dll` from the Releases page.
+1. Download the latest `Emby.InvidiousPlugin.dll` from the [Releases](https://github.com/eliasbruno124-dev/Emby-Invidious-Plugin/releases) page.
 2. Stop your Emby Server.
-3. Place the `.dll` file directly into your Emby plugins folder:
+3. Place the `.dll` file into your Emby plugins folder:
+
    * **Path:** `/programdata/plugins`
 4. Restart your Emby Server.
 5. The plugin will now appear in your Emby dashboard under **Plugins**.
 
----
+### Requirements
+
+* **FFmpeg** — Required for 4K/1080p HLS muxing. The plugin auto-detects FFmpeg from common paths (Emby bundled, system PATH, `/usr/bin/ffmpeg`, etc.). Without FFmpeg, only direct MP4 streams (720p/480p) are available.
+
+\---
 
 ## ⚙️ Configuration
 
-Settings Screenshot <img width="1913" height="868" alt="plugin" src="https://github.com/user-attachments/assets/d4ad03fa-a2e2-4dfe-99d2-5810c7aa1c05" /><img width="1918" height="867" alt="plugin settings" src="https://github.com/user-attachments/assets/43b2364a-8966-494f-acd3-431850dcc35b" />
-
+Settings Screenshot !\[plugin](https://github.com/user-attachments/assets/d4ad03fa-a2e2-4dfe-99d2-5810c7aa1c05)!\[plugin settings](https://github.com/user-attachments/assets/43b2364a-8966-494f-acd3-431850dcc35b)
 
 Go to your Emby Dashboard and open the "Invidious" plugin settings.
 
-1. **My Invidious Instance URL:** Enter the URL of your self-hosted Invidious instance (e.g., `http://localhost:3000`).
-2. **Max Videos:** Set the maximum number of videos you want to load per channel or search query.
-3. **My YouTube Content:** Simply separate your entries with a comma:
-   * **Channel:** Start with an `@` (e.g., `@GitHub`).
-   * **Playlist:** Enter the playlist ID starting with `PL` (e.g., `PL0lo9MOBetEFcp...`).
-   * **Search:** Just type regular search terms (e.g., `Minecraft Trailer`).
+### Connection
 
-*Example input:* `@GitHub, PL0lo9MOBetEFcp4SCWinBdpml9B2U25-f, Linux Tutorials`
+|Setting|Description|
+|-|-|
+|**Invidious Instance URL**|URL of your self-hosted Invidious instance. Supports Basic Auth: `https://User:Password@invidious.example.com`|
 
----
+### Content Sources
+
+|Setting|Description|
+|-|-|
+|**My YouTube Content**|Comma-separated list: `@Handle` for channels, `UCxxxxx` for channel IDs, `PLxxxxx` for playlists, any text for search queries|
+
+*Example:* `@GitHub, PL0lo9MOBetEFcp4SCWinBdpml9B2U25-f, Linux Tutorials`
+
+### Discover
+
+|Setting|Default|Description|
+|-|-|-|
+|**Show Trending**|✅ On|Show a "Trending" folder with trending and popular videos|
+|**Trending Region**|`DE`|ISO 3166-1 country code (e.g. `DE`, `US`, `AT`, `CH`, `GB`, `FR`)|
+
+### Sorting
+
+|Setting|Default|Description|
+|-|-|-|
+|**Sort Channel Videos By**|`newest`|Options: `newest`, `oldest`, `popular`|
+
+### Limits
+
+|Setting|Default|Range|Description|
+|-|-|-|-|
+|**Max Videos per Channel/Playlist**|50|1–150|Maximum videos loaded per channel or playlist|
+|**Max Videos per Search Query**|50|1–150|Maximum videos loaded per search query|
+
+### Caching
+
+|Setting|Default|Range|Description|
+|-|-|-|-|
+|**HLS Cache Duration (Days)**|3|0–30|How long to keep muxed HLS segments on disk. Set to 0 to always re-mux.|
+
+\---
 
 ## 🔄 Keeping Content Updated (Scheduled Tasks)
 
-To fetch new videos from your saved channels and playlists, Emby uses an automated background task. Here is how to set it up perfectly:
+To fetch new videos from your saved channels and playlists, Emby uses an automated background task:
 
 1. Go to **Scheduled Tasks** in your Emby Dashboard.
 2. Look for the task named **Refresh Internet Channels**.
 3. Click on it and add a new **Task Trigger**.
 4. Set the interval to run e.g., **every 15 minutes**. This keeps your Emby perfectly in sync with your Invidious playlists!
 
----
+\---
+
+## 🏗️ Architecture
+
+|File|Purpose|
+|-|-|
+|`InvidiousChannel.cs`|Main channel provider — folder structure, video listing, media info, Shorts/Live detection|
+|`InvidiousApi.cs`|Static HTTP client with retry logic, all Invidious API calls, thumbnail rewriting|
+|`MuxHelper.cs`|FFmpeg HLS muxing, process management, segment caching, playback.m3u8 updates|
+|`PluginConfiguration.cs`|All user-facing settings with `EditableOptionsBase`|
+|`Plugin.cs`|Plugin entry point and instance holder|
+|`thumb.png`|Channel logo|
+
+\---
 
 ## 🛠️ For Developers (Compiling)
+
 1. Clone this repository.
 2. Open the project in Visual Studio.
 3. Ensure you have the required Emby Server references added (`MediaBrowser.Server.Core`).
 4. Build the project as a Class Library.
+5. Copy the `.dll` and `thumb.png` to your Emby plugins folder.
+
+\---
 
 ## 💖 Donate
 
-[![PayPal](https://img.shields.io/badge/PayPal-00457C?style=for-the-badge&logo=paypal&logoColor=white)](https://paypal.me/eliasbruno123)
+[!\[PayPal](https://img.shields.io/badge/PayPal-00457C?style=for-the-badge\&logo=paypal\&logoColor=white)](https://paypal.me/eliasbruno123)
 
 ## 📄 License
+
 This project is open-source and free to use, modify, and distribute.
+
