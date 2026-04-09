@@ -53,10 +53,6 @@ Plugin Screenshot !\[main site](https://github.com/user-attachments/assets/a9bc0
 4. Restart your Emby Server.
 5. The plugin will now appear in your Emby dashboard under **Plugins**.
 
-### Requirements
-
-* **FFmpeg** — Required for 4K/1080p HLS muxing. The plugin auto-detects FFmpeg from common paths (Emby bundled, system PATH, `/usr/bin/ffmpeg`, etc.). Without FFmpeg, only direct MP4 streams (720p/480p) are available.
-
 \---
 
 ## ⚙️ Configuration
@@ -131,19 +127,9 @@ To fetch new videos from your saved channels and playlists, Emby uses an automat
 
 \---
 
-## 🛠️ For Developers (Compiling)
-
-1. Clone this repository.
-2. Open the project in Visual Studio.
-3. Ensure you have the required Emby Server references added (`MediaBrowser.Server.Core`).
-4. Build the project as a Class Library.
-5. Copy the `.dll` and `thumb.png` to your Emby plugins folder.
-
-\---
-
 ## 💖 Donate
 
-[!\[PayPal](https://img.shields.io/badge/PayPal-00457C?style=for-the-badge\&logo=paypal\&logoColor=white)](https://paypal.me/eliasbruno123)
+[![PayPal](https://img.shields.io/badge/PayPal-00457C?style=for-the-badge&logo=paypal&logoColor=white)](https://paypal.me/eliasbruno123)
 
 ## 📄 License
 
