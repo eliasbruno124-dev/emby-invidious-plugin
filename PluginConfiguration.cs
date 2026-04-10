@@ -48,7 +48,7 @@ namespace Emby.InvidiousPlugin
             "ISO 3166-1 country code for YouTube trending results.\n" +
             "Examples: DE (Germany), US (USA), AT (Austria), CH (Switzerland), GB (UK), FR (France).\n" +
             "Leave empty for Invidious default.")]
-        public string TrendingRegion { get; set; } = "DE";
+        public string TrendingRegion { get; set; } = "US";
 
         // ─────────────────────────────────────────────────────────────────────
         // SORTING
@@ -92,6 +92,6 @@ namespace Emby.InvidiousPlugin
             "Higher values allow more parallel streams but use more CPU and RAM.\n" +
             "Set to 0 for unlimited. Default: 4.")]
         [Range(0, 32)]
-        public int MaxConcurrentMuxes { get; set; } = 4;
+        public int MaxConcurrentMuxes { get; set; } = 0;
     }
 }
