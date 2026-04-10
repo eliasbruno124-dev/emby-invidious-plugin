@@ -738,24 +738,19 @@ namespace Emby.InvidiousPlugin
                     }
                     else
                     {
-                        var capturedVideoUrl = videoMuxUrl;
-                        var capturedAudioUrl = audioMuxUrl;
-                        var capturedId = videoId;
-                        var capturedHeight = q.height;
-                        var capturedIsVp9 = q.isVp9;
+                        var playbackPath = MuxHelper.PreparePlaybackPath(videoId, q.height);
 
-                        var muxTask = Task.Run(() => MuxHelper.MuxToHlsAsync(
-                            capturedVideoUrl, capturedAudioUrl,
-                            capturedId, capturedHeight, capturedIsVp9));
+                        _ = Task.Run(() => MuxHelper.MuxToHlsAsync(
+                            videoMuxUrl, audioMuxUrl,
+                            videoId, q.height, q.isVp9));
 
-                        // ── VERBESSERT: mehr Segmente abwarten ──
-                        var readyPath = await WaitForFirstSegments(
-                            capturedId, capturedHeight, muxTask,
-                            cancellationToken).ConfigureAwait(false);
+                        // Kurz warten (max 2s) bis mindestens 1 Segment da ist
+                        // → sofortiges Abspielen möglich, aber kein langes Blockieren
+                        await QuickWaitForFirstSegment(playbackPath, cancellationToken)
+                            .ConfigureAwait(false);
 
-                        if (!string.IsNullOrEmpty(readyPath))
-                            sources.Add(BuildHlsSource(videoId, q.height, w,
-                                q.label, videoCodec, readyPath!));
+                        sources.Add(BuildHlsSource(videoId, q.height, w,
+                            q.label, videoCodec, playbackPath));
                     }
                 }
 
@@ -957,54 +952,43 @@ namespace Emby.InvidiousPlugin
             };
         }
 
-        // ── VERBESSERT: Mehr Segmente + längerer Wait ──
-        private const int FirstSegmentWaitMs = 25000;  // war 15000
-        private const int FirstSegmentPollMs = 400;    // war 500
-        private const int MinReadySegments = 4;        // war 2 → weniger Stottern!
-
-        private static async Task<string?> WaitForFirstSegments(
-            string videoId, int height, Task muxTask, CancellationToken ct)
+        // ────────────────────────────────────────────────────────────
+        //  Kurzer Wait: max 2s, pollt alle 200ms ob mindestens
+        //  1 Segment in playback.m3u8 steht → sofort abspielen.
+        //  Gibt immer zurück — blockiert nie länger als 2s.
+        // ────────────────────────────────────────────────────────────
+        private static async Task QuickWaitForFirstSegment(
+            string playbackPath, CancellationToken ct)
         {
-            var playbackPath = MuxHelper.PreparePlaybackPath(videoId, height);
-            int iterations = FirstSegmentWaitMs / FirstSegmentPollMs;
+            const int maxMs = 4500;
+            const int pollMs = 200;
+            int waited = 0;
 
-            for (int i = 0; i < iterations; i++)
+            while (waited < maxMs)
             {
                 ct.ThrowIfCancellationRequested();
-                await Task.Delay(FirstSegmentPollMs, ct).ConfigureAwait(false);
-
-                if (muxTask.IsFaulted) return null;
+                await Task.Delay(pollMs, ct).ConfigureAwait(false);
+                waited += pollMs;
 
                 try
                 {
                     if (File.Exists(playbackPath))
                     {
                         var content = File.ReadAllText(playbackPath);
-                        if (CountPlaybackSegments(content) >= MinReadySegments)
-                            return playbackPath;
+                        foreach (var line in content.Split('\n'))
+                        {
+                            var t = line.Trim();
+                            if (t.EndsWith(".ts", StringComparison.Ordinal)
+                                || t.EndsWith(".m4s", StringComparison.Ordinal))
+                                return; // Mindestens 1 Segment → ready
+                        }
                     }
                 }
                 catch { }
             }
-
-            if (File.Exists(playbackPath))
-                return playbackPath;
-
-            return null;
+            // Timeout → trotzdem zurückkehren, Emby bekommt die Source
         }
 
-        private static int CountPlaybackSegments(string content)
-        {
-            int count = 0;
-            foreach (var line in content.Split('\n'))
-            {
-                var t = line.Trim();
-                if (t.EndsWith(".ts", StringComparison.Ordinal)
-                    || t.EndsWith(".m4s", StringComparison.Ordinal))
-                    count++;
-            }
-            return count;
-        }
 
         private static MediaSourceInfo BuildReelSource(
             string videoId, string itag, string label,
