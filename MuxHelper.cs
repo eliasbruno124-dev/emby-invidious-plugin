@@ -16,14 +16,42 @@ namespace Emby.InvidiousPlugin
 
         private static readonly ConcurrentDictionary<string, Process> RunningProcesses = new();
 
-        private static readonly SemaphoreSlim MuxGate = new(4, 4);
+        // Dynamisch konfigurierbar — 0 = unlimited
+        private static SemaphoreSlim MuxGate = new(4, 4);
+        private static int _currentMuxLimit = 4;
+        private static readonly object MuxGateLock = new();
 
-        private const int MinSegmentsForPlayback = 2;
+        private static SemaphoreSlim GetMuxGate()
+        {
+            int configured;
+            try
+            {
+                var plugin = Plugin.Instance;
+                configured = plugin != null ? plugin.Options.MaxConcurrentMuxes : 4;
+            }
+            catch { configured = 4; }
+
+            // 0 = unlimited → wir setzen auf 64 als praktisches Maximum
+            if (configured <= 0) configured = 64;
+
+            lock (MuxGateLock)
+            {
+                if (configured != _currentMuxLimit)
+                {
+                    Log($"MuxGate limit changed: {_currentMuxLimit} → {configured}");
+                    MuxGate = new SemaphoreSlim(configured, configured);
+                    _currentMuxLimit = configured;
+                }
+                return MuxGate;
+            }
+        }
+
+        private const int MinSegmentsForPlayback = 4;   // war 2 → mehr Buffer
         private const int MinSegmentsForCache = 6;
-        private const int SegmentWaitMaxIterations = 240;
+        private const int SegmentWaitMaxIterations = 300; // war 240 → mehr Geduld
         private const int RunningProcessWaitMaxIterations = 120;
-        private const int PollIntervalMs = 500;
-        private const int PlaybackUpdateIntervalMs = 1000;
+        private const int PollIntervalMs = 400;           // war 500 → schnellere Reaktion
+        private const int PlaybackUpdateIntervalMs = 800;  // war 1000 → häufigere Updates
 
         static MuxHelper()
         {
@@ -43,11 +71,18 @@ namespace Emby.InvidiousPlugin
                 {
                     var oldLog = LogPath + ".old";
                     try { File.Move(LogPath, oldLog, overwrite: true); }
-                    catch (Exception ex) { Debug.WriteLine($"[MuxHelper] Log rotation failed: {ex.Message}"); }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"[MuxHelper] Log rotation failed: {ex.Message}");
+                    }
                 }
-                File.AppendAllText(LogPath, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} [T{Environment.CurrentManagedThreadId}] {msg}\r\n");
+                File.AppendAllText(LogPath,
+                    $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} [T{Environment.CurrentManagedThreadId}] {msg}\r\n");
             }
-            catch (Exception ex) { Debug.WriteLine($"[MuxHelper] Log write failed: {ex.Message}"); }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[MuxHelper] Log write failed: {ex.Message}");
+            }
         }
 
         public static int ActiveMuxCount => RunningProcesses.Count;
@@ -56,11 +91,19 @@ namespace Emby.InvidiousPlugin
         {
             foreach (var key in RunningProcesses.Keys)
             {
-                if (key == videoId || key.StartsWith(videoId + "_", StringComparison.Ordinal))
+                if (key == videoId
+                    || key.StartsWith(videoId + "_", StringComparison.Ordinal))
                 {
                     if (RunningProcesses.TryRemove(key, out var proc))
                     {
-                        try { if (!proc.HasExited) { proc.Kill(); Log($"Killed FFmpeg for {key}"); } }
+                        try
+                        {
+                            if (!proc.HasExited)
+                            {
+                                proc.Kill();
+                                Log($"Killed FFmpeg for {key}");
+                            }
+                        }
                         catch (Exception ex) { Log($"Kill failed for {key}: {ex.Message}"); }
                         finally { try { proc.Dispose(); } catch { } }
                     }
@@ -93,10 +136,14 @@ namespace Emby.InvidiousPlugin
                 var age = DateTime.UtcNow - File.GetLastWriteTimeUtc(m3u8);
                 if (age.TotalDays > GetCacheDays()) return null;
                 var content = File.ReadAllText(m3u8);
-                if (content.Contains("#EXT-X-ENDLIST") && CountSegments(content) >= MinSegmentsForCache)
+                if (content.Contains("#EXT-X-ENDLIST")
+                    && CountSegments(content) >= MinSegmentsForCache)
                     return File.Exists(playback) ? playback : m3u8;
             }
-            catch (Exception ex) { Log($"GetCachedStreamPath error for {videoId}_{height}p: {ex.Message}"); }
+            catch (Exception ex)
+            {
+                Log($"GetCachedStreamPath error for {videoId}_{height}p: {ex.Message}");
+            }
 
             var processKey = $"{videoId}_{height}p";
             if (RunningProcesses.ContainsKey(processKey) && File.Exists(playback))
@@ -107,7 +154,10 @@ namespace Emby.InvidiousPlugin
                     if (CountSegments(content) >= MinSegmentsForPlayback)
                         return playback;
                 }
-                catch (Exception ex) { Log($"GetCachedStreamPath running-check error for {processKey}: {ex.Message}"); }
+                catch (Exception ex)
+                {
+                    Log($"GetCachedStreamPath running-check error for {processKey}: {ex.Message}");
+                }
             }
 
             return null;
@@ -125,7 +175,10 @@ namespace Emby.InvidiousPlugin
                     File.WriteAllText(playback,
                         "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:0\n");
                 }
-                catch (Exception ex) { Log($"PreparePlaybackPath write error: {ex.Message}"); }
+                catch (Exception ex)
+                {
+                    Log($"PreparePlaybackPath write error: {ex.Message}");
+                }
             }
             return playback;
         }
@@ -175,7 +228,8 @@ namespace Emby.InvidiousPlugin
             foreach (var line in content.Split('\n'))
             {
                 var t = line.Trim();
-                if (t.EndsWith(".ts", StringComparison.Ordinal) || t.EndsWith(".m4s", StringComparison.Ordinal))
+                if (t.EndsWith(".ts", StringComparison.Ordinal)
+                    || t.EndsWith(".m4s", StringComparison.Ordinal))
                     count++;
             }
             return count;
@@ -197,7 +251,7 @@ namespace Emby.InvidiousPlugin
 
                 if (RunningProcesses.ContainsKey(processKey))
                 {
-                    Log($"FFmpeg already running for {processKey}, waiting for segments...");
+                    Log($"FFmpeg already running for {processKey}, waiting...");
                     for (int i = 0; i < RunningProcessWaitMaxIterations; i++)
                     {
                         ct.ThrowIfCancellationRequested();
@@ -213,11 +267,14 @@ namespace Emby.InvidiousPlugin
                                 int segs = CountSegments(c);
                                 if (segs >= MinSegmentsForPlayback)
                                 {
-                                    Log($"Ready to stream: {segs} segments in {processKey}");
+                                    Log($"Ready: {segs} segments in {processKey}");
                                     return playback;
                                 }
                             }
-                            catch (Exception ex) { Log($"Segment check error for {processKey}: {ex.Message}"); }
+                            catch (Exception ex)
+                            {
+                                Log($"Segment check error for {processKey}: {ex.Message}");
+                            }
                         }
                     }
                     if (File.Exists(playback))
@@ -225,14 +282,24 @@ namespace Emby.InvidiousPlugin
                         var fc = File.ReadAllText(playback);
                         if (CountSegments(fc) >= 1) return playback;
                     }
-                    Log("Wait timeout for running process, returning null");
+                    Log("Wait timeout for running process");
                     return null;
                 }
 
                 if (RunningProcesses.TryRemove(processKey, out var oldProc))
                 {
-                    try { if (!oldProc.HasExited) { oldProc.Kill(); Log($"Killed stale FFmpeg for {processKey}"); } }
-                    catch (Exception ex) { Log($"Stale process cleanup error: {ex.Message}"); }
+                    try
+                    {
+                        if (!oldProc.HasExited)
+                        {
+                            oldProc.Kill();
+                            Log($"Killed stale FFmpeg for {processKey}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"Stale process cleanup error: {ex.Message}");
+                    }
                     finally { try { oldProc.Dispose(); } catch { } }
                 }
 
@@ -242,7 +309,8 @@ namespace Emby.InvidiousPlugin
                     if (age.TotalDays < GetCacheDays())
                     {
                         var cached = File.ReadAllText(m3u8);
-                        if (cached.Contains("#EXT-X-ENDLIST") && CountSegments(cached) >= MinSegmentsForCache)
+                        if (cached.Contains("#EXT-X-ENDLIST")
+                            && CountSegments(cached) >= MinSegmentsForCache)
                         {
                             Log($"Cache hit ({CountSegments(cached)} segments)");
                             UpdatePlaybackM3u8(m3u8, playback);
@@ -251,14 +319,18 @@ namespace Emby.InvidiousPlugin
                         Log($"Cache stale ({CountSegments(cached)} segs), re-muxing");
                     }
                     try { Directory.Delete(videoDir, true); }
-                    catch (Exception ex) { Log($"Cache dir cleanup error: {ex.Message}"); }
+                    catch (Exception ex)
+                    {
+                        Log($"Cache dir cleanup error: {ex.Message}");
+                    }
                 }
 
                 Directory.CreateDirectory(videoDir);
 
-                if (!await MuxGate.WaitAsync(TimeSpan.FromSeconds(30), ct).ConfigureAwait(false))
+                if (!await GetMuxGate().WaitAsync(TimeSpan.FromSeconds(30), ct)
+                    .ConfigureAwait(false))
                 {
-                    Log($"FAIL: Too many concurrent muxes ({ActiveMuxCount}), rejecting {processKey}");
+                    Log($"FAIL: Too many muxes ({ActiveMuxCount}), rejecting {processKey}");
                     return null;
                 }
 
@@ -270,19 +342,33 @@ namespace Emby.InvidiousPlugin
                     string segExt = isVp9 ? "m4s" : "ts";
                     var segPattern = Path.Combine(videoDir, $"seg_%04d.{segExt}");
 
+                    // ── VERBESSERT: Buffer-Einstellungen gegen Stottern ──
+                    // -probesize 10M: mehr Daten analysieren vor Start
+                    // -analyzeduration 5M: längere Analyse
+                    // -hls_time 4: kürzere Segmente = schnellerer Start
+                    // -hls_init_time 2: erstes Segment klein halten
                     string codecArgs = isVp9
                         ? "-c:v copy -c:a copy -hls_segment_type fmp4"
                         : "-c:v copy -c:a copy -bsf:v h264_mp4toannexb";
 
-                    var args = $"-y " +
-                               $"-i \"{directVideoUrl}\" " +
-                               $"-i \"{directAudioUrl}\" " +
-                               $"-map 0:v:0 -map 1:a:0 " +
-                               $"-fflags +genpts+discardcorrupt " +
-                               $"-avoid_negative_ts make_zero " +
-                               $"{codecArgs} " +
-                               $"-f hls -hls_time 6 -hls_list_size 0 -hls_flags append_list -start_number 0 " +
-                               $"-hls_segment_filename \"{segPattern}\" \"{m3u8}\"";
+                    var args =
+                        $"-y " +
+                        $"-probesize 10M -analyzeduration 5M " +
+                        $"-reconnect 1 -reconnect_streamed 1 " +
+                        $"-reconnect_delay_max 5 " +
+                        $"-i \"{directVideoUrl}\" " +
+                        $"-reconnect 1 -reconnect_streamed 1 " +
+                        $"-reconnect_delay_max 5 " +
+                        $"-i \"{directAudioUrl}\" " +
+                        $"-map 0:v:0 -map 1:a:0 " +
+                        $"-fflags +genpts+discardcorrupt " +
+                        $"-avoid_negative_ts make_zero " +
+                        $"-max_muxing_queue_size 4096 " +
+                        $"{codecArgs} " +
+                        $"-f hls -hls_time 4 -hls_init_time 2 " +
+                        $"-hls_list_size 0 -hls_flags append_list " +
+                        $"-start_number 0 " +
+                        $"-hls_segment_filename \"{segPattern}\" \"{m3u8}\"";
 
                     Log($"Starting FFmpeg: {ffmpeg}");
                     var psi = new ProcessStartInfo
@@ -317,17 +403,24 @@ namespace Emby.InvidiousPlugin
                                 if (line != null)
                                 {
                                     var t = line.Trim();
-                                    if (!string.IsNullOrEmpty(t) && !t.StartsWith("frame=", StringComparison.Ordinal))
+                                    if (!string.IsNullOrEmpty(t)
+                                        && !t.StartsWith("frame=", StringComparison.Ordinal))
                                         Log($"FFmpeg[{processKey}]: {t}");
                                 }
                             }
                         }
-                        catch (Exception ex) { Log($"FFmpeg stderr reader error for {processKey}: {ex.Message}"); }
+                        catch (Exception ex)
+                        {
+                            Log($"FFmpeg stderr reader error for {processKey}: {ex.Message}");
+                        }
                         finally
                         {
                             int exitCode = -1;
                             try { exitCode = process.ExitCode; }
-                            catch (Exception ex) { Log($"ExitCode read error for {processKey}: {ex.Message}"); }
+                            catch (Exception ex)
+                            {
+                                Log($"ExitCode read error for {processKey}: {ex.Message}");
+                            }
                             Log($"FFmpeg finished for {processKey}: exit={exitCode}");
 
                             if (exitCode == 0)
@@ -345,7 +438,10 @@ namespace Emby.InvidiousPlugin
                                         UpdatePlaybackM3u8(m3u8, playback);
                                     }
                                 }
-                                catch (Exception ex) { Log($"Post-mux finalization error for {processKey}: {ex.Message}"); }
+                                catch (Exception ex)
+                                {
+                                    Log($"Post-mux error for {processKey}: {ex.Message}");
+                                }
                             }
 
                             RunningProcesses.TryRemove(processKey, out _);
@@ -371,7 +467,11 @@ namespace Emby.InvidiousPlugin
 
                         bool hasExited;
                         int exitCode;
-                        try { hasExited = process.HasExited; exitCode = hasExited ? process.ExitCode : 0; }
+                        try
+                        {
+                            hasExited = process.HasExited;
+                            exitCode = hasExited ? process.ExitCode : 0;
+                        }
                         catch (Exception ex)
                         {
                             Log($"FAIL: Lost FFmpeg process handle: {ex.Message}");
@@ -393,16 +493,20 @@ namespace Emby.InvidiousPlugin
                                 var content = File.ReadAllText(playback);
                                 if (CountSegments(content) >= MinSegmentsForPlayback)
                                 {
-                                    Log($"SUCCESS: {CountSegments(content)} segments ready for {processKey}");
+                                    Log($"SUCCESS: {CountSegments(content)} segments for {processKey}");
                                     return playback;
                                 }
                             }
-                            catch (Exception ex) { Log($"Segment read error during wait: {ex.Message}"); }
+                            catch (Exception ex)
+                            {
+                                Log($"Segment read error: {ex.Message}");
+                            }
                         }
                     }
 
-                    Log($"FAIL: Timeout waiting for segments ({SegmentWaitMaxIterations * PollIntervalMs / 1000}s) for {processKey}");
-                    try { process.Kill(); } catch (Exception ex) { Log($"Timeout kill error: {ex.Message}"); }
+                    Log($"FAIL: Timeout ({SegmentWaitMaxIterations * PollIntervalMs / 1000}s) for {processKey}");
+                    try { process.Kill(); }
+                    catch (Exception ex) { Log($"Timeout kill error: {ex.Message}"); }
                     RunningProcesses.TryRemove(processKey, out _);
                     return null;
                 }
@@ -431,14 +535,12 @@ namespace Emby.InvidiousPlugin
             if (!string.IsNullOrEmpty(fromPath)) return fromPath!;
 
             var candidates = new List<string>();
-
             var appBase = AppDomain.CurrentDomain.BaseDirectory ?? "";
             if (!string.IsNullOrEmpty(appBase))
             {
                 candidates.Add(Path.Combine(appBase, "ffmpeg.exe"));
                 candidates.Add(Path.Combine(appBase, "ffmpeg"));
             }
-
             candidates.AddRange(new[]
             {
                 @"C:\Program Files\Emby-Server\system\ffmpeg.exe",
@@ -454,13 +556,11 @@ namespace Emby.InvidiousPlugin
                 "/usr/local/opt/ffmpeg/bin/ffmpeg",
                 "/snap/bin/ffmpeg",
             });
-
             foreach (var path in candidates)
             {
                 try { if (File.Exists(path)) return path; }
                 catch { }
             }
-
             return "ffmpeg";
         }
 
@@ -482,7 +582,8 @@ namespace Emby.InvidiousPlugin
                 if (proc == null) return null;
                 var output = proc.StandardOutput.ReadLine()?.Trim();
                 proc.WaitForExit(3000);
-                return !string.IsNullOrEmpty(output) && File.Exists(output) ? output : null;
+                return !string.IsNullOrEmpty(output) && File.Exists(output)
+                    ? output : null;
             }
             catch { return null; }
         }
@@ -491,12 +592,17 @@ namespace Emby.InvidiousPlugin
         {
             var candidates = new[]
             {
-                Path.Combine(Environment.GetEnvironmentVariable("XDG_CACHE_HOME") ?? "", "invidious-hls"),
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Emby.InvidiousPlugin", "hls-cache"),
+                Path.Combine(
+                    Environment.GetEnvironmentVariable("XDG_CACHE_HOME") ?? "",
+                    "invidious-hls"),
+                Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "Emby.InvidiousPlugin", "hls-cache"),
                 Path.Combine(Path.GetTempPath(), "emby-invidious-hls"),
-                Path.Combine(AppDomain.CurrentDomain.BaseDirectory ?? "", "..", "cache", "invidious-hls"),
+                Path.Combine(
+                    AppDomain.CurrentDomain.BaseDirectory ?? "",
+                    "..", "cache", "invidious-hls"),
             };
-
             foreach (var dir in candidates)
             {
                 if (string.IsNullOrWhiteSpace(dir)) continue;
@@ -511,7 +617,6 @@ namespace Emby.InvidiousPlugin
                 }
                 catch { }
             }
-
             var fallback = Path.Combine(Path.GetTempPath(), "emby-invidious-hls");
             try { Directory.CreateDirectory(fallback); } catch { }
             return fallback;
@@ -524,10 +629,18 @@ namespace Emby.InvidiousPlugin
                 int cacheDays = GetCacheDays();
                 foreach (var dir in Directory.GetDirectories(CacheDir))
                 {
-                    if ((DateTime.UtcNow - Directory.GetLastWriteTimeUtc(dir)).TotalDays > cacheDays)
+                    if ((DateTime.UtcNow - Directory.GetLastWriteTimeUtc(dir)).TotalDays
+                        > cacheDays)
                     {
-                        try { Directory.Delete(dir, true); Log($"Deleted old cache: {Path.GetFileName(dir)}"); }
-                        catch (Exception ex) { Log($"CleanOldDirs delete error: {ex.Message}"); }
+                        try
+                        {
+                            Directory.Delete(dir, true);
+                            Log($"Deleted old cache: {Path.GetFileName(dir)}");
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"CleanOldDirs delete error: {ex.Message}");
+                        }
                     }
                 }
             }

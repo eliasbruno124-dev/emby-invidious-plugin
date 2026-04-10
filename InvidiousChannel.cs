@@ -21,7 +21,7 @@ namespace Emby.InvidiousPlugin
         public string Name => "Invidious";
         public string Description => "Privacy-friendly YouTube via your Invidious instance.";
         public string Id => "invidious_channel_20";
-        public string DataVersion => "8.0.0";
+        public string DataVersion => "9.0.0";
         public ChannelParentalRating ParentalRating => ChannelParentalRating.GeneralAudience;
         public bool IsEnabledByDefault => true;
 
@@ -34,9 +34,17 @@ namespace Emby.InvidiousPlugin
         private const string Itag480p = "18";
         private const int MaxMetaCacheEntries = 2000;
 
-        private record VideoMeta(string? Overview, DateTime? Premiere, int? Year, long? RuntimeTicks, DateTime CachedAt);
+        private record VideoMeta(
+            string? Overview, DateTime? Premiere, int? Year,
+            long? RuntimeTicks, DateTime CachedAt);
+
         private static readonly ConcurrentDictionary<string, VideoMeta> MetaCache = new();
         private static readonly TimeSpan MetaCacheTtl = TimeSpan.FromDays(365);
+
+        // ── RATE LIMITER: verhindert API-Blocking ──
+        // Max 4 gleichzeitige Enrichment-Calls + Mindestabstand 150ms pro Call
+        private static readonly SemaphoreSlim EnrichSemaphore = new(4, 4);
+        private const int EnrichDelayMs = 150;
 
         public ChannelFeatures GetChannelFeatures()
         {
@@ -79,7 +87,12 @@ namespace Emby.InvidiousPlugin
                 if (string.IsNullOrEmpty(query.FolderId))
                 {
                     if (config.ShowTrending)
-                        items.Add(new ChannelItemInfo { Name = "Trending", Id = "trending_x_all", Type = ChannelItemType.Folder });
+                        items.Add(new ChannelItemInfo
+                        {
+                            Name = "Trending",
+                            Id = "trending_x_all",
+                            Type = ChannelItemType.Folder
+                        });
 
                     var savedItems = (config.SavedItems ?? "")
                         .Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
@@ -91,7 +104,8 @@ namespace Emby.InvidiousPlugin
 
                         if (term.StartsWith(HandlePrefix))
                         {
-                            var d = await InvidiousApi.GetChannelDetailsAsync(baseUrl, term, true, cancellationToken).ConfigureAwait(false);
+                            var d = await InvidiousApi.GetChannelDetailsAsync(
+                                baseUrl, term, true, cancellationToken).ConfigureAwait(false);
                             return new ChannelItemInfo
                             {
                                 Name = d.name ?? term,
@@ -102,7 +116,8 @@ namespace Emby.InvidiousPlugin
                         }
                         if (term.StartsWith(ChannelIdPrefix) && term.Length > MinChannelIdLength)
                         {
-                            var d = await InvidiousApi.GetChannelDetailsAsync(baseUrl, term, false, cancellationToken).ConfigureAwait(false);
+                            var d = await InvidiousApi.GetChannelDetailsAsync(
+                                baseUrl, term, false, cancellationToken).ConfigureAwait(false);
                             return new ChannelItemInfo
                             {
                                 Name = d.name ?? "Channel",
@@ -113,7 +128,8 @@ namespace Emby.InvidiousPlugin
                         }
                         if (term.StartsWith(PlaylistPrefix))
                         {
-                            var d = await InvidiousApi.GetPlaylistDetailsAsync(baseUrl, term, cancellationToken).ConfigureAwait(false);
+                            var d = await InvidiousApi.GetPlaylistDetailsAsync(
+                                baseUrl, term, cancellationToken).ConfigureAwait(false);
                             return new ChannelItemInfo
                             {
                                 Name = d.name ?? "Playlist",
@@ -133,7 +149,11 @@ namespace Emby.InvidiousPlugin
                     foreach (var res in await Task.WhenAll(menuTasks).ConfigureAwait(false))
                         if (res != null) items.Add(res);
 
-                    return new ChannelItemResult { Items = items, TotalRecordCount = items.Count };
+                    return new ChannelItemResult
+                    {
+                        Items = items,
+                        TotalRecordCount = items.Count
+                    };
                 }
 
                 if (query.FolderId.Contains(FolderSeparator))
@@ -146,11 +166,14 @@ namespace Emby.InvidiousPlugin
                     if (type == "trending")
                     {
                         string region = (config.TrendingRegion ?? "").Trim();
-                        return await LoadTrending(baseUrl, cancellationToken, region).ConfigureAwait(false);
+                        return await LoadTrending(baseUrl, cancellationToken, region)
+                            .ConfigureAwait(false);
                     }
 
                     int startIndex = query.StartIndex ?? 0;
-                    int limit = type == "search" ? ClampVideos(config.MaxSearchVideos) : ClampVideos(config.MaxChannelVideos);
+                    int limit = type == "search"
+                        ? ClampVideos(config.MaxSearchVideos)
+                        : ClampVideos(config.MaxChannelVideos);
 
                     int firstPageSize = -1;
                     int lastPageSize = -1;
@@ -165,14 +188,20 @@ namespace Emby.InvidiousPlugin
 
                         JsonDocument? doc = null;
                         if (type == "search")
-                            doc = await InvidiousApi.SearchVideosAsync(baseUrl, term, currentPage, cancellationToken).ConfigureAwait(false);
+                            doc = await InvidiousApi.SearchVideosAsync(
+                                baseUrl, term, currentPage, cancellationToken).ConfigureAwait(false);
                         else if (type == "channel")
-                            doc = await InvidiousApi.GetChannelVideosAsync(baseUrl, term, currentPage, cancellationToken, config.ChannelSortBy).ConfigureAwait(false);
+                            doc = await InvidiousApi.GetChannelVideosAsync(
+                                baseUrl, term, currentPage, cancellationToken,
+                                config.ChannelSortBy).ConfigureAwait(false);
                         else if (type == "playlist")
-                            doc = await InvidiousApi.GetPlaylistVideosAsync(baseUrl, term, currentPage, cancellationToken).ConfigureAwait(false);
+                            doc = await InvidiousApi.GetPlaylistVideosAsync(
+                                baseUrl, term, currentPage, cancellationToken).ConfigureAwait(false);
 
                         if (doc == null) break;
 
+                        // ── ExtractVideos holt jetzt ALLE verfügbaren Felder
+                        //    direkt aus der Liste (description, published, viewCount) ──
                         var tempItems = ExtractVideos(doc);
                         doc.Dispose();
                         lastPageSize = tempItems.Count;
@@ -184,85 +213,30 @@ namespace Emby.InvidiousPlugin
                         {
                             if (skipItems > 0) { skipItems--; continue; }
                             seeking = false;
-                            if (seenIds.Add(item.Id)) batch.Add(item);
+                            // Deduplizierung auf Basis der reinen Video-ID
+                            // (ohne LIVE_/REEL_-Prefix)
+                            var rawId = item.Id;
+                            if (rawId.StartsWith(LivePrefix, StringComparison.Ordinal))
+                                rawId = rawId.Substring(LivePrefix.Length);
+                            else if (rawId.StartsWith(ReelPrefix, StringComparison.Ordinal))
+                                rawId = rawId.Substring(ReelPrefix.Length);
+                            if (seenIds.Add(rawId)) batch.Add(item);
                             if (items.Count + batch.Count >= limit) break;
                         }
 
-                        var uncached = new List<ChannelItemInfo>();
-                        foreach (var item in batch)
-                        {
-                            if (MetaCache.TryGetValue(item.Id, out var cached))
-                            {
-                                if (!string.IsNullOrEmpty(cached.Overview)) item.Overview = cached.Overview;
-                                if (cached.Premiere.HasValue) { item.PremiereDate = cached.Premiere; item.DateCreated = cached.Premiere; }
-                                if (cached.Year.HasValue) item.ProductionYear = cached.Year;
-                                if (cached.RuntimeTicks.HasValue) item.RunTimeTicks = cached.RuntimeTicks;
-                            }
-                            else
-                            {
-                                uncached.Add(item);
-                            }
-                        }
+                        // ── Cache-Lookup + selektives Enrichment ──
+                        ApplyCachedMeta(batch);
+
+                        // Nur Videos ohne Beschreibung UND ohne Cache enrichen
+                        var uncached = batch
+                            .Where(i => string.IsNullOrEmpty(i.Overview)
+                                        && !MetaCache.ContainsKey(i.Id))
+                            .ToList();
 
                         if (uncached.Count > 0)
                         {
-                            try
-                            {
-                                using var enrichCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                                enrichCts.CancelAfter(TimeSpan.FromSeconds(15));
-                                var enrichToken = enrichCts.Token;
-
-                                using var sem = new SemaphoreSlim(4);
-                                await Task.WhenAll(uncached.Select(async item =>
-                                {
-                                    await sem.WaitAsync(enrichToken).ConfigureAwait(false);
-                                    try
-                                    {
-                                        using var vDoc = await InvidiousApi.TryGetVideoAsync(baseUrl, item.Id, enrichToken).ConfigureAwait(false);
-                                        if (vDoc == null)
-                                        {
-                                            MetaCache[item.Id] = new VideoMeta(null, null, null, null, DateTime.UtcNow);
-                                            return;
-                                        }
-                                        var r = vDoc.RootElement;
-
-                                        var desc = InvidiousApi.GetString(r, "description");
-                                        var views = InvidiousApi.GetLong(r, "viewCount");
-                                        string? overview = null;
-                                        if (!string.IsNullOrWhiteSpace(desc))
-                                        {
-                                            overview = (views > 0 ? $"{views:N0} views\n\n" : "") + desc;
-                                            item.Overview = overview;
-                                        }
-
-                                        var pub = InvidiousApi.GetLong(r, "published");
-                                        DateTime? premiere = null;
-                                        int? year = null;
-                                        if (pub.HasValue)
-                                        {
-                                            var dt = DateTimeOffset.FromUnixTimeSeconds(pub.Value).UtcDateTime;
-                                            premiere = dt;
-                                            year = dt.Year;
-                                            item.PremiereDate = dt;
-                                            item.DateCreated = dt;
-                                            item.ProductionYear = dt.Year;
-                                        }
-
-                                        var len = InvidiousApi.GetInt(r, "lengthSeconds");
-                                        long? ticks = null;
-                                        if (len > 0)
-                                        {
-                                            ticks = TimeSpan.FromSeconds(len.Value).Ticks;
-                                            item.RunTimeTicks = ticks;
-                                        }
-
-                                        MetaCache[item.Id] = new VideoMeta(overview, premiere, year, ticks, DateTime.UtcNow);
-                                    }
-                                    finally { sem.Release(); }
-                                })).ConfigureAwait(false);
-                            }
-                            catch (OperationCanceledException) { }
-
+                            await EnrichVideosThrottled(
+                                baseUrl, uncached, cancellationToken).ConfigureAwait(false);
                             EvictExpiredMetaCache();
                         }
 
@@ -285,7 +259,11 @@ namespace Emby.InvidiousPlugin
                         ? startIndex + items.Count + 1
                         : startIndex + items.Count;
 
-                    return new ChannelItemResult { Items = items, TotalRecordCount = total };
+                    return new ChannelItemResult
+                    {
+                        Items = items,
+                        TotalRecordCount = total
+                    };
                 }
 
                 return new ChannelItemResult { Items = items };
@@ -296,6 +274,123 @@ namespace Emby.InvidiousPlugin
             }
         }
 
+        // ────────────────────────────────────────────────────────────
+        //  NEU: Cached-Meta auf Batch anwenden
+        // ────────────────────────────────────────────────────────────
+        private static void ApplyCachedMeta(List<ChannelItemInfo> batch)
+        {
+            foreach (var item in batch)
+            {
+                if (!MetaCache.TryGetValue(item.Id, out var cached)) continue;
+
+                if (!string.IsNullOrEmpty(cached.Overview) && string.IsNullOrEmpty(item.Overview))
+                    item.Overview = cached.Overview;
+
+                if (cached.Premiere.HasValue && !item.PremiereDate.HasValue)
+                {
+                    item.PremiereDate = cached.Premiere;
+                    item.DateCreated = cached.Premiere;
+                }
+                if (cached.Year.HasValue && !item.ProductionYear.HasValue)
+                    item.ProductionYear = cached.Year;
+                if (cached.RuntimeTicks.HasValue && !item.RunTimeTicks.HasValue)
+                    item.RunTimeTicks = cached.RuntimeTicks;
+            }
+        }
+
+        // ────────────────────────────────────────────────────────────
+        //  NEU: Throttled Enrichment — max 2 gleichzeitig + Delay
+        //  → Verhindert API-Blocking durch Invidious/YouTube
+        // ────────────────────────────────────────────────────────────
+        private static async Task EnrichVideosThrottled(
+            string baseUrl, List<ChannelItemInfo> uncached, CancellationToken ct)
+        {
+            try
+            {
+                using var enrichCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                enrichCts.CancelAfter(TimeSpan.FromSeconds(30));
+                var token = enrichCts.Token;
+
+                // Semi-parallel: bis zu 4 gleichzeitig mit kurzem Delay
+                var tasks = new List<Task>();
+                foreach (var item in uncached)
+                {
+                    token.ThrowIfCancellationRequested();
+
+                    await EnrichSemaphore.WaitAsync(token).ConfigureAwait(false);
+                    var capturedItem = item;
+                    tasks.Add(Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await EnrichSingleVideo(baseUrl, capturedItem, token)
+                                .ConfigureAwait(false);
+                            await Task.Delay(EnrichDelayMs, token).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException) { }
+                        finally
+                        {
+                            EnrichSemaphore.Release();
+                        }
+                    }, token));
+                }
+
+                await Task.WhenAll(tasks).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { }
+        }
+
+        private static async Task EnrichSingleVideo(
+            string baseUrl, ChannelItemInfo item, CancellationToken ct)
+        {
+            using var vDoc = await InvidiousApi.TryGetVideoAsync(
+                baseUrl, item.Id, ct).ConfigureAwait(false);
+
+            if (vDoc == null)
+            {
+                // Negativ-Cache: nicht nochmal versuchen
+                MetaCache[item.Id] = new VideoMeta(null, null, null, null, DateTime.UtcNow);
+                return;
+            }
+
+            var r = vDoc.RootElement;
+
+            var desc = InvidiousApi.GetString(r, "description");
+            var views = InvidiousApi.GetLong(r, "viewCount");
+            string? overview = null;
+            if (!string.IsNullOrWhiteSpace(desc))
+            {
+                overview = (views > 0 ? $"{views:N0} views\n\n" : "") + desc;
+                item.Overview = overview;
+            }
+
+            var pub = InvidiousApi.GetLong(r, "published");
+            DateTime? premiere = null;
+            int? year = null;
+            if (pub.HasValue)
+            {
+                var dt = DateTimeOffset.FromUnixTimeSeconds(pub.Value).UtcDateTime;
+                premiere = dt;
+                year = dt.Year;
+                item.PremiereDate = dt;
+                item.DateCreated = dt;
+                item.ProductionYear = dt.Year;
+            }
+
+            var len = InvidiousApi.GetInt(r, "lengthSeconds");
+            long? ticks = null;
+            if (len > 0)
+            {
+                ticks = TimeSpan.FromSeconds(len.Value).Ticks;
+                item.RunTimeTicks = ticks;
+            }
+
+            MetaCache[item.Id] = new VideoMeta(overview, premiere, year, ticks, DateTime.UtcNow);
+        }
+
+        // ────────────────────────────────────────────────────────────
+        //  Trending
+        // ────────────────────────────────────────────────────────────
         private static async Task<ChannelItemResult> LoadTrending(
             string baseUrl, CancellationToken ct, string region = "")
         {
@@ -324,20 +419,33 @@ namespace Emby.InvidiousPlugin
             }
             catch (Exception ex)
             {
-                var err = new List<ChannelItemInfo>();
-                return Msg(err, $"ERROR: {ex.Message}");
+                return Msg(new List<ChannelItemInfo>(), $"ERROR: {ex.Message}");
             }
 
             if (allVideos.Count == 0)
+                return Msg(new List<ChannelItemInfo>(), "No results.");
+
+            // ── Enrichment: Beschreibungen für Trending-Videos laden ──
+            ApplyCachedMeta(allVideos);
+            var uncached = allVideos
+                .Where(i => string.IsNullOrEmpty(i.Overview)
+                            && !MetaCache.ContainsKey(i.Id))
+                .ToList();
+            if (uncached.Count > 0)
             {
-                var err = new List<ChannelItemInfo>();
-                return Msg(err, "No results.");
+                await EnrichVideosThrottled(baseUrl, uncached, ct)
+                    .ConfigureAwait(false);
+                EvictExpiredMetaCache();
             }
 
             for (int i = 0; i < allVideos.Count; i++)
                 allVideos[i].Name = $"{(i + 1):D3} | {allVideos[i].Name}";
 
-            return new ChannelItemResult { Items = allVideos, TotalRecordCount = allVideos.Count };
+            return new ChannelItemResult
+            {
+                Items = allVideos,
+                TotalRecordCount = allVideos.Count
+            };
         }
 
         private static async Task<JsonDocument?> SafeGetJson(Func<Task<JsonDocument>> factory)
@@ -346,6 +454,10 @@ namespace Emby.InvidiousPlugin
             catch { return null; }
         }
 
+        // ────────────────────────────────────────────────────────────
+        //  VERBESSERT: ExtractVideos holt jetzt description + viewCount
+        //  direkt aus den Listendaten → kein Extra-API-Call nötig!
+        // ────────────────────────────────────────────────────────────
         private const string LivePrefix = "LIVE_";
         private const string ReelPrefix = "REEL_";
         private const int ReelMaxSeconds = 180;
@@ -361,7 +473,8 @@ namespace Emby.InvidiousPlugin
                 arr = doc.RootElement;
                 found = true;
             }
-            else if (doc.RootElement.TryGetProperty("videos", out var v) && v.ValueKind == JsonValueKind.Array)
+            else if (doc.RootElement.TryGetProperty("videos", out var v)
+                     && v.ValueKind == JsonValueKind.Array)
             {
                 arr = v;
                 found = true;
@@ -375,11 +488,29 @@ namespace Emby.InvidiousPlugin
 
                 var title = InvidiousApi.GetString(el, "title") ?? "Untitled";
                 var author = InvidiousApi.GetString(el, "author") ?? "Unknown";
+
+                // ── Datum direkt aus der Suche/Channelliste ──
                 var pubUnix = InvidiousApi.GetLong(el, "published");
                 DateTime? premiere = pubUnix.HasValue
                     ? DateTimeOffset.FromUnixTimeSeconds(pubUnix.Value).UtcDateTime
                     : null;
+
                 var len = InvidiousApi.GetInt(el, "lengthSeconds");
+
+                // ── Beschreibung direkt aus der Liste holen ──
+                var description = InvidiousApi.GetString(el, "description")
+                               ?? InvidiousApi.GetString(el, "descriptionHtml");
+                var viewCount = InvidiousApi.GetLong(el, "viewCount");
+
+                string? overview = null;
+                if (!string.IsNullOrWhiteSpace(description))
+                {
+                    overview = (viewCount > 0 ? $"{viewCount:N0} views\n\n" : "") + description;
+                }
+                else if (viewCount > 0)
+                {
+                    overview = $"{viewCount:N0} views";
+                }
 
                 bool isLive = false;
                 if (el.TryGetProperty("liveNow", out var liveProp))
@@ -390,10 +521,12 @@ namespace Emby.InvidiousPlugin
                 bool isReel = false;
                 if (!isLive)
                 {
-                    if (el.TryGetProperty("isShort", out var shortProp) && shortProp.ValueKind == JsonValueKind.True)
+                    if (el.TryGetProperty("isShort", out var shortProp)
+                        && shortProp.ValueKind == JsonValueKind.True)
                         isReel = true;
-                    else if (el.TryGetProperty("genre", out var genreProp) && 
-                             "short".Equals(genreProp.GetString(), StringComparison.OrdinalIgnoreCase))
+                    else if (el.TryGetProperty("genre", out var genreProp)
+                             && "short".Equals(genreProp.GetString(),
+                                 StringComparison.OrdinalIgnoreCase))
                         isReel = true;
                     else if (len.HasValue && len.Value > 0 && len.Value <= ReelMaxSeconds)
                         isReel = true;
@@ -408,28 +541,47 @@ namespace Emby.InvidiousPlugin
                     : isReel ? $"▶ Short: {title}"
                     : title;
 
-                list.Add(new ChannelItemInfo
+                var info = new ChannelItemInfo
                 {
                     Name = displayTitle,
                     SeriesName = author,
                     Studios = new List<string> { author },
+                    Overview = overview,  // ← NEU: direkt gesetzt
                     ProductionYear = premiere?.Year,
                     DateCreated = premiere,
                     PremiereDate = premiere,
-                    RunTimeTicks = isLive ? null : (len > 0 ? TimeSpan.FromSeconds(len.Value).Ticks : null),
+                    RunTimeTicks = isLive
+                        ? null
+                        : (len > 0 ? TimeSpan.FromSeconds(len.Value).Ticks : null),
                     ContentType = ChannelMediaContentType.Episode,
                     Id = itemId,
                     Type = ChannelItemType.Media,
                     MediaType = ChannelMediaType.Video,
                     ImageUrl = thumb
-                });
+                };
+
+                // ── Sofort in Cache schreiben wenn wir Daten haben ──
+                if (overview != null || premiere.HasValue || len > 0)
+                {
+                    MetaCache[itemId] = new VideoMeta(
+                        overview, premiere, premiere?.Year,
+                        len > 0 ? TimeSpan.FromSeconds(len.Value).Ticks : null,
+                        DateTime.UtcNow);
+                }
+
+                list.Add(info);
             }
             return list;
         }
 
         private static string BestVideoThumbnail(JsonElement el, string videoId)
         {
-            if (el.TryGetProperty("videoThumbnails", out var thumbArr) && thumbArr.ValueKind == JsonValueKind.Array)
+            // Immer YouTube-CDN verwenden — Invidious-URLs brauchen Auth
+            // und sind bei neuen Videos oft noch nicht verfügbar.
+            var ytCdn = $"https://i.ytimg.com/vi/{videoId}/mqdefault.jpg";
+
+            if (el.TryGetProperty("videoThumbnails", out var thumbArr)
+                && thumbArr.ValueKind == JsonValueKind.Array)
             {
                 string? bestUrl = null;
                 int bestWidth = 0;
@@ -438,16 +590,26 @@ namespace Emby.InvidiousPlugin
                     var url = InvidiousApi.GetString(t, "url");
                     if (string.IsNullOrEmpty(url)) continue;
                     url = InvidiousApi.RewriteThumbnailUrl(url);
+
+                    // Nur YouTube-CDN-URLs akzeptieren, keine Invidious-URLs
+                    if (!url.Contains("ytimg.com", StringComparison.Ordinal)
+                        && !url.Contains("ggpht.com", StringComparison.Ordinal))
+                        continue;
+
                     var w = InvidiousApi.GetInt(t, "width") ?? 0;
                     if (w >= bestWidth) { bestWidth = w; bestUrl = url; }
                 }
                 if (!string.IsNullOrEmpty(bestUrl)) return bestUrl!;
             }
 
-            return $"https://i.ytimg.com/vi/{videoId}/hqdefault.jpg";
+            return ytCdn;
         }
 
-        public async Task<IEnumerable<MediaSourceInfo>> GetChannelItemMediaInfo(string id, CancellationToken cancellationToken)
+        // ────────────────────────────────────────────────────────────
+        //  Media Playback — HLS Stottern behoben
+        // ────────────────────────────────────────────────────────────
+        public async Task<IEnumerable<MediaSourceInfo>> GetChannelItemMediaInfo(
+            string id, CancellationToken cancellationToken)
         {
             var plugin = Plugin.Instance;
             if (plugin == null) return new List<MediaSourceInfo>();
@@ -465,10 +627,12 @@ namespace Emby.InvidiousPlugin
 
             try
             {
-                using var videoDoc = await InvidiousApi.GetVideoAsync(baseUrl, videoId, cancellationToken).ConfigureAwait(false);
+                using var videoDoc = await InvidiousApi.GetVideoAsync(
+                    baseUrl, videoId, cancellationToken).ConfigureAwait(false);
                 var root = videoDoc.RootElement;
 
-                if (isLive || (root.TryGetProperty("liveNow", out var ln) && ln.ValueKind == JsonValueKind.True))
+                if (isLive || (root.TryGetProperty("liveNow", out var ln)
+                               && ln.ValueKind == JsonValueKind.True))
                 {
                     var hlsUrl = InvidiousApi.GetString(root, "hlsUrl");
                     if (!string.IsNullOrEmpty(hlsUrl))
@@ -520,13 +684,13 @@ namespace Emby.InvidiousPlugin
 
                     var reelMuxed = ExtractMuxedStreams(root);
                     foreach (var m in reelMuxed.OrderByDescending(x => x.height))
-                    {
-                        sources.Add(BuildReelSource(videoId, m.itag, m.label, reelW, reelH, baseUrl, headers));
-                    }
+                        sources.Add(BuildReelSource(videoId, m.itag, m.label,
+                            reelW, reelH, baseUrl, headers));
+
                     if (sources.Count == 0)
-                    {
-                        sources.Add(BuildReelSource(videoId, Itag480p, "Short", reelW, reelH, baseUrl, headers));
-                    }
+                        sources.Add(BuildReelSource(videoId, Itag480p, "Short",
+                            reelW, reelH, baseUrl, headers));
+
                     return sources;
                 }
 
@@ -534,19 +698,27 @@ namespace Emby.InvidiousPlugin
                 var bestAudio = FindBestAudio(root);
                 var muxedStreams = ExtractMuxedStreams(root);
 
-                int maxMuxedHeight = muxedStreams.Count > 0 ? muxedStreams.Max(m => m.height) : 0;
+                int maxMuxedHeight = muxedStreams.Count > 0
+                    ? muxedStreams.Max(m => m.height) : 0;
 
                 string audioMuxUrl = !string.IsNullOrEmpty(bestAudio.url)
                     ? bestAudio.url!
                     : $"{baseUrl}/latest_version?id={videoId}&itag={bestAudio.itag}&local=true";
 
-                var hlsQualities = new List<(string itag, string? url, int height, string label, bool isVp9)>();
-                bool canMux = bestVideo.itag != null && (bestAudio.url != null || bestAudio.itag != null);
+                var hlsQualities =
+                    new List<(string itag, string? url, int height, string label, bool isVp9)>();
+                bool canMux = bestVideo.itag != null
+                              && (bestAudio.url != null || bestAudio.itag != null);
+
                 if (canMux && (bestVideo.height >= 1080 || bestVideo.height > maxMuxedHeight))
                 {
-                    hlsQualities.Add((bestVideo.itag!, bestVideo.url, bestVideo.height, bestVideo.label ?? $"{bestVideo.height}p", bestVideo.isVp9));
+                    hlsQualities.Add((bestVideo.itag!, bestVideo.url, bestVideo.height,
+                        bestVideo.label ?? $"{bestVideo.height}p", bestVideo.isVp9));
+
                     if (bestVideo.height > 1080 && bestVideo.fallback1080Itag != null)
-                        hlsQualities.Add((bestVideo.fallback1080Itag!, bestVideo.fallback1080Url, 1080, bestVideo.fallback1080Label ?? "1080p", bestVideo.fallback1080IsVp9));
+                        hlsQualities.Add((bestVideo.fallback1080Itag!, bestVideo.fallback1080Url,
+                            1080, bestVideo.fallback1080Label ?? "1080p",
+                            bestVideo.fallback1080IsVp9));
                 }
 
                 foreach (var q in hlsQualities.OrderByDescending(x => x.height))
@@ -561,7 +733,8 @@ namespace Emby.InvidiousPlugin
 
                     if (cachedStream != null)
                     {
-                        sources.Add(BuildHlsSource(videoId, q.height, w, q.label, videoCodec, cachedStream));
+                        sources.Add(BuildHlsSource(videoId, q.height, w,
+                            q.label, videoCodec, cachedStream));
                     }
                     else
                     {
@@ -570,32 +743,35 @@ namespace Emby.InvidiousPlugin
                         var capturedId = videoId;
                         var capturedHeight = q.height;
                         var capturedIsVp9 = q.isVp9;
+
                         var muxTask = Task.Run(() => MuxHelper.MuxToHlsAsync(
                             capturedVideoUrl, capturedAudioUrl,
                             capturedId, capturedHeight, capturedIsVp9));
 
+                        // ── VERBESSERT: mehr Segmente abwarten ──
                         var readyPath = await WaitForFirstSegments(
-                            capturedId, capturedHeight, muxTask, cancellationToken).ConfigureAwait(false);
+                            capturedId, capturedHeight, muxTask,
+                            cancellationToken).ConfigureAwait(false);
 
                         if (!string.IsNullOrEmpty(readyPath))
-                            sources.Add(BuildHlsSource(videoId, q.height, w, q.label, videoCodec, readyPath!));
+                            sources.Add(BuildHlsSource(videoId, q.height, w,
+                                q.label, videoCodec, readyPath!));
                     }
                 }
 
                 foreach (var m in muxedStreams.OrderByDescending(x => x.height))
-                {
-                    sources.Add(BuildDirectSource(videoId, m.height, m.label, m.itag, baseUrl, headers));
-                }
+                    sources.Add(BuildDirectSource(videoId, m.height, m.label,
+                        m.itag, baseUrl, headers));
 
                 if (sources.Count == 0)
-                {
-                    sources.Add(BuildDirectSource(videoId, 480, "SD Fallback", Itag480p, baseUrl, headers));
-                }
+                    sources.Add(BuildDirectSource(videoId, 480, "SD Fallback",
+                        Itag480p, baseUrl, headers));
             }
             catch (OperationCanceledException) { }
             catch
             {
-                sources.Add(BuildDirectSource(videoId, 480, "Invidious (Fallback)", Itag480p, baseUrl, headers));
+                sources.Add(BuildDirectSource(videoId, 480, "Invidious (Fallback)",
+                    Itag480p, baseUrl, headers));
             }
 
             return sources;
@@ -603,7 +779,8 @@ namespace Emby.InvidiousPlugin
 
         private record AdaptiveVideoResult(
             string? itag, string? url, int height, string? label, bool isVp9,
-            string? fallback1080Itag, string? fallback1080Url, string? fallback1080Label, bool fallback1080IsVp9);
+            string? fallback1080Itag, string? fallback1080Url,
+            string? fallback1080Label, bool fallback1080IsVp9);
 
         private record AdaptiveAudioResult(string? itag, string? url, int bitrate);
 
@@ -616,8 +793,10 @@ namespace Emby.InvidiousPlugin
             string? fb1080Itag = null, fb1080Url = null, fb1080Label = null;
             bool fb1080IsVp9 = false;
 
-            if (!root.TryGetProperty("adaptiveFormats", out var adaptive) || adaptive.ValueKind != JsonValueKind.Array)
-                return new AdaptiveVideoResult(null, null, 0, null, false, null, null, null, false);
+            if (!root.TryGetProperty("adaptiveFormats", out var adaptive)
+                || adaptive.ValueKind != JsonValueKind.Array)
+                return new AdaptiveVideoResult(null, null, 0, null, false,
+                    null, null, null, false);
 
             foreach (var el in adaptive.EnumerateArray())
             {
@@ -636,16 +815,18 @@ namespace Emby.InvidiousPlugin
 
                 if (h > bestHeight || (h == bestHeight && isH264 && bestIsVp9))
                 {
-                    bestHeight = h; bestItag = itag; bestUrl = url; bestLabel = label; bestIsVp9 = isVp9;
+                    bestHeight = h; bestItag = itag; bestUrl = url;
+                    bestLabel = label; bestIsVp9 = isVp9;
                 }
                 if (h == 1080 && (fb1080Itag == null || (isH264 && fb1080IsVp9)))
                 {
-                    fb1080Itag = itag; fb1080Url = url; fb1080Label = label; fb1080IsVp9 = isVp9;
+                    fb1080Itag = itag; fb1080Url = url;
+                    fb1080Label = label; fb1080IsVp9 = isVp9;
                 }
             }
 
-            return new AdaptiveVideoResult(bestItag, bestUrl, bestHeight, bestLabel, bestIsVp9,
-                fb1080Itag, fb1080Url, fb1080Label, fb1080IsVp9);
+            return new AdaptiveVideoResult(bestItag, bestUrl, bestHeight, bestLabel,
+                bestIsVp9, fb1080Itag, fb1080Url, fb1080Label, fb1080IsVp9);
         }
 
         private static AdaptiveAudioResult FindBestAudio(JsonElement root)
@@ -654,49 +835,57 @@ namespace Emby.InvidiousPlugin
             int bestBitrate = 0;
             bool bestIsOriginal = false;
 
-            if (!root.TryGetProperty("adaptiveFormats", out var adaptive) || adaptive.ValueKind != JsonValueKind.Array)
+            if (!root.TryGetProperty("adaptiveFormats", out var adaptive)
+                || adaptive.ValueKind != JsonValueKind.Array)
                 return new AdaptiveAudioResult(null, null, 0);
 
             foreach (var el in adaptive.EnumerateArray())
             {
                 var type = InvidiousApi.GetString(el, "type") ?? "";
-                if (!type.StartsWith("audio/mp4") && !type.StartsWith("audio/m4a")) continue;
+                if (!type.StartsWith("audio/mp4") && !type.StartsWith("audio/m4a"))
+                    continue;
 
                 var itag = InvidiousApi.GetString(el, "itag");
                 var url = InvidiousApi.GetString(el, "url");
                 int br = InvidiousApi.GetInt(el, "bitrate") ?? 0;
 
                 bool isOriginal = true;
-                if (el.TryGetProperty("audioTrack", out var audioTrack) && audioTrack.ValueKind == JsonValueKind.Object)
+                if (el.TryGetProperty("audioTrack", out var audioTrack)
+                    && audioTrack.ValueKind == JsonValueKind.Object)
                 {
                     if (audioTrack.TryGetProperty("audioIsDefault", out var defProp))
                     {
-                        isOriginal = defProp.ValueKind == JsonValueKind.True ||
-                            (defProp.ValueKind == JsonValueKind.String &&
-                             "true".Equals(defProp.GetString(), StringComparison.OrdinalIgnoreCase));
+                        isOriginal = defProp.ValueKind == JsonValueKind.True
+                            || (defProp.ValueKind == JsonValueKind.String
+                                && "true".Equals(defProp.GetString(),
+                                    StringComparison.OrdinalIgnoreCase));
                     }
                 }
 
-                bool shouldReplace = (isOriginal && !bestIsOriginal) ||
-                                     (isOriginal == bestIsOriginal && br > bestBitrate);
+                bool shouldReplace = (isOriginal && !bestIsOriginal)
+                                     || (isOriginal == bestIsOriginal && br > bestBitrate);
                 if (shouldReplace)
                 {
-                    bestBitrate = br; bestItag = itag; bestUrl = url; bestIsOriginal = isOriginal;
+                    bestBitrate = br; bestItag = itag;
+                    bestUrl = url; bestIsOriginal = isOriginal;
                 }
             }
 
             return new AdaptiveAudioResult(bestItag, bestUrl, bestBitrate);
         }
 
-        private static List<(string itag, int height, string label)> ExtractMuxedStreams(JsonElement root)
+        private static List<(string itag, int height, string label)> ExtractMuxedStreams(
+            JsonElement root)
         {
             var result = new List<(string itag, int height, string label)>();
-            if (!root.TryGetProperty("formatStreams", out var fmtArr) || fmtArr.ValueKind != JsonValueKind.Array)
+            if (!root.TryGetProperty("formatStreams", out var fmtArr)
+                || fmtArr.ValueKind != JsonValueKind.Array)
                 return result;
 
             foreach (var el in fmtArr.EnumerateArray())
             {
-                if (!(InvidiousApi.GetString(el, "container") ?? "").Contains("mp4", StringComparison.OrdinalIgnoreCase))
+                if (!(InvidiousApi.GetString(el, "container") ?? "")
+                    .Contains("mp4", StringComparison.OrdinalIgnoreCase))
                     continue;
                 var itag = InvidiousApi.GetString(el, "itag") ?? "";
                 int h = ParseHeightFromElement(el);
@@ -716,7 +905,8 @@ namespace Emby.InvidiousPlugin
         }
 
         private static MediaSourceInfo BuildHlsSource(
-            string videoId, int height, int width, string label, string codec, string path)
+            string videoId, int height, int width,
+            string label, string codec, string path)
         {
             return new MediaSourceInfo
             {
@@ -732,8 +922,18 @@ namespace Emby.InvidiousPlugin
                 DefaultAudioStreamIndex = 1,
                 MediaStreams = new List<MediaStream>
                 {
-                    new MediaStream { Type = MediaStreamType.Video, Index = 0, Codec = codec, Width = width, Height = height, IsDefault = true },
-                    new MediaStream { Type = MediaStreamType.Audio, Index = 1, Codec = "aac", Channels = 2, SampleRate = 44100, IsDefault = true }
+                    new MediaStream
+                    {
+                        Type = MediaStreamType.Video, Index = 0,
+                        Codec = codec, Width = width, Height = height,
+                        IsDefault = true
+                    },
+                    new MediaStream
+                    {
+                        Type = MediaStreamType.Audio, Index = 1,
+                        Codec = "aac", Channels = 2, SampleRate = 44100,
+                        IsDefault = true
+                    }
                 }
             };
         }
@@ -757,9 +957,10 @@ namespace Emby.InvidiousPlugin
             };
         }
 
-        private const int FirstSegmentWaitMs = 15000;
-        private const int FirstSegmentPollMs = 500;
-        private const int MinReadySegments = 2;
+        // ── VERBESSERT: Mehr Segmente + längerer Wait ──
+        private const int FirstSegmentWaitMs = 25000;  // war 15000
+        private const int FirstSegmentPollMs = 400;    // war 500
+        private const int MinReadySegments = 4;        // war 2 → weniger Stottern!
 
         private static async Task<string?> WaitForFirstSegments(
             string videoId, int height, Task muxTask, CancellationToken ct)
@@ -798,7 +999,8 @@ namespace Emby.InvidiousPlugin
             foreach (var line in content.Split('\n'))
             {
                 var t = line.Trim();
-                if (t.EndsWith(".ts", StringComparison.Ordinal) || t.EndsWith(".m4s", StringComparison.Ordinal))
+                if (t.EndsWith(".ts", StringComparison.Ordinal)
+                    || t.EndsWith(".m4s", StringComparison.Ordinal))
                     count++;
             }
             return count;
@@ -806,7 +1008,8 @@ namespace Emby.InvidiousPlugin
 
         private static MediaSourceInfo BuildReelSource(
             string videoId, string itag, string label,
-            int width, int height, string baseUrl, Dictionary<string, string> headers)
+            int width, int height, string baseUrl,
+            Dictionary<string, string> headers)
         {
             return new MediaSourceInfo
             {
@@ -824,21 +1027,14 @@ namespace Emby.InvidiousPlugin
                 {
                     new MediaStream
                     {
-                        Type = MediaStreamType.Video,
-                        Index = 0,
-                        Codec = "h264",
-                        Width = width,
-                        Height = height,
-                        AspectRatio = $"{width}:{height}",
-                        IsDefault = true
+                        Type = MediaStreamType.Video, Index = 0,
+                        Codec = "h264", Width = width, Height = height,
+                        AspectRatio = $"{width}:{height}", IsDefault = true
                     },
                     new MediaStream
                     {
-                        Type = MediaStreamType.Audio,
-                        Index = 1,
-                        Codec = "aac",
-                        Channels = 2,
-                        SampleRate = 44100,
+                        Type = MediaStreamType.Audio, Index = 1,
+                        Codec = "aac", Channels = 2, SampleRate = 44100,
                         IsDefault = true
                     }
                 }
@@ -847,7 +1043,8 @@ namespace Emby.InvidiousPlugin
 
         private static (int w, int h) GetVerticalDimensions(JsonElement root)
         {
-            if (root.TryGetProperty("adaptiveFormats", out var adaptive) && adaptive.ValueKind == JsonValueKind.Array)
+            if (root.TryGetProperty("adaptiveFormats", out var adaptive)
+                && adaptive.ValueKind == JsonValueKind.Array)
             {
                 int bestW = 0, bestH = 0;
                 foreach (var el in adaptive.EnumerateArray())
@@ -857,10 +1054,10 @@ namespace Emby.InvidiousPlugin
                     var size = InvidiousApi.GetString(el, "size");
                     if (string.IsNullOrEmpty(size)) continue;
                     var xIdx = size.IndexOf('x');
-                    if (xIdx > 0 &&
-                        int.TryParse(size.Substring(0, xIdx), out var w) &&
-                        int.TryParse(size.Substring(xIdx + 1), out var h) &&
-                        h > w && h > bestH)
+                    if (xIdx > 0
+                        && int.TryParse(size.Substring(0, xIdx), out var w)
+                        && int.TryParse(size.Substring(xIdx + 1), out var h)
+                        && h > w && h > bestH)
                     {
                         bestW = w; bestH = h;
                     }
@@ -872,45 +1069,36 @@ namespace Emby.InvidiousPlugin
 
         private static bool IsVerticalVideo(JsonElement root)
         {
-            if (root.TryGetProperty("adaptiveFormats", out var adaptive) && adaptive.ValueKind == JsonValueKind.Array)
+            if (root.TryGetProperty("adaptiveFormats", out var adaptive)
+                && adaptive.ValueKind == JsonValueKind.Array)
             {
                 foreach (var el in adaptive.EnumerateArray())
                 {
                     var type = InvidiousApi.GetString(el, "type") ?? "";
                     if (!type.StartsWith("video/")) continue;
-
                     var size = InvidiousApi.GetString(el, "size");
-                    if (!string.IsNullOrEmpty(size))
-                    {
-                        var xIdx = size.IndexOf('x');
-                        if (xIdx > 0 &&
-                            int.TryParse(size.Substring(0, xIdx), out var w) &&
-                            int.TryParse(size.Substring(xIdx + 1), out var h))
-                        {
-                            return h > w;
-                        }
-                    }
+                    if (string.IsNullOrEmpty(size)) continue;
+                    var xIdx = size.IndexOf('x');
+                    if (xIdx > 0
+                        && int.TryParse(size.Substring(0, xIdx), out var w)
+                        && int.TryParse(size.Substring(xIdx + 1), out var h))
+                        return h > w;
                 }
             }
-
-            if (root.TryGetProperty("formatStreams", out var fmtArr) && fmtArr.ValueKind == JsonValueKind.Array)
+            if (root.TryGetProperty("formatStreams", out var fmtArr)
+                && fmtArr.ValueKind == JsonValueKind.Array)
             {
                 foreach (var el in fmtArr.EnumerateArray())
                 {
                     var size = InvidiousApi.GetString(el, "size");
-                    if (!string.IsNullOrEmpty(size))
-                    {
-                        var xIdx = size.IndexOf('x');
-                        if (xIdx > 0 &&
-                            int.TryParse(size.Substring(0, xIdx), out var w) &&
-                            int.TryParse(size.Substring(xIdx + 1), out var h))
-                        {
-                            return h > w;
-                        }
-                    }
+                    if (string.IsNullOrEmpty(size)) continue;
+                    var xIdx = size.IndexOf('x');
+                    if (xIdx > 0
+                        && int.TryParse(size.Substring(0, xIdx), out var w)
+                        && int.TryParse(size.Substring(xIdx + 1), out var h))
+                        return h > w;
                 }
             }
-
             return false;
         }
 
@@ -930,12 +1118,21 @@ namespace Emby.InvidiousPlugin
             if (!string.IsNullOrEmpty(size))
             {
                 var idx = size.IndexOf('x');
-                if (idx > 0 && int.TryParse(size.Substring(idx + 1), out var h)) return h;
+                if (idx > 0 && int.TryParse(size.Substring(idx + 1), out var h))
+                    return h;
             }
             var res = InvidiousApi.GetString(el, "resolution");
-            if (!string.IsNullOrEmpty(res)) { var n = ExtractLeadingNumber(res); if (n > 0) return n; }
+            if (!string.IsNullOrEmpty(res))
+            {
+                var n = ExtractLeadingNumber(res);
+                if (n > 0) return n;
+            }
             var ql = InvidiousApi.GetString(el, "qualityLabel");
-            if (!string.IsNullOrEmpty(ql)) { var n = ExtractLeadingNumber(ql); if (n > 0) return n; }
+            if (!string.IsNullOrEmpty(ql))
+            {
+                var n = ExtractLeadingNumber(ql);
+                if (n > 0) return n;
+            }
             return 0;
         }
 
@@ -951,10 +1148,10 @@ namespace Emby.InvidiousPlugin
         public IEnumerable<ImageType> GetSupportedChannelImages() =>
             new List<ImageType> { ImageType.Thumb, ImageType.Primary };
 
-        public Task<DynamicImageResponse> GetChannelImage(ImageType type, CancellationToken cancellationToken)
+        public Task<DynamicImageResponse> GetChannelImage(
+            ImageType type, CancellationToken cancellationToken)
         {
             var response = new DynamicImageResponse();
-
             var t = GetType();
             var stream = t.Assembly.GetManifestResourceStream(t.Namespace + ".thumb.png");
             if (stream != null)
@@ -963,7 +1160,6 @@ namespace Emby.InvidiousPlugin
                 response.Stream = stream;
                 return Task.FromResult(response);
             }
-
             var assemblyDir = Path.GetDirectoryName(t.Assembly.Location) ?? "";
             var filePath = Path.Combine(assemblyDir, "thumb.png");
             if (File.Exists(filePath))
@@ -971,14 +1167,22 @@ namespace Emby.InvidiousPlugin
                 response.Format = ImageFormat.Png;
                 response.Path = filePath;
             }
-
             return Task.FromResult(response);
         }
 
         private static ChannelItemResult Msg(List<ChannelItemInfo> items, string msg)
         {
-            items.Add(new ChannelItemInfo { Name = msg, Id = "msg", Type = ChannelItemType.Folder });
-            return new ChannelItemResult { Items = items, TotalRecordCount = items.Count };
+            items.Add(new ChannelItemInfo
+            {
+                Name = msg,
+                Id = "msg",
+                Type = ChannelItemType.Folder
+            });
+            return new ChannelItemResult
+            {
+                Items = items,
+                TotalRecordCount = items.Count
+            };
         }
     }
 }

@@ -30,6 +30,33 @@ namespace Emby.InvidiousPlugin
 
         private static readonly int[] RetryDelaysMs = { 800, 2500 };
 
+        // ── NEU: Globaler Rate Limiter ──
+        // Max 3 gleichzeitige API-Calls + 200ms Mindestabstand
+        private static readonly SemaphoreSlim ApiGate = new(3, 3);
+        private static long _lastCallTicks = 0;
+        private const int MinCallIntervalMs = 200;
+
+        private static async Task ThrottleAsync(CancellationToken ct)
+        {
+            await ApiGate.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                var now = Environment.TickCount64;
+                var last = Interlocked.Read(ref _lastCallTicks);
+                var elapsed = now - last;
+                if (elapsed < MinCallIntervalMs)
+                {
+                    await Task.Delay((int)(MinCallIntervalMs - elapsed), ct)
+                        .ConfigureAwait(false);
+                }
+                Interlocked.Exchange(ref _lastCallTicks, Environment.TickCount64);
+            }
+            finally
+            {
+                ApiGate.Release();
+            }
+        }
+
         private static Uri BaseUri(string baseUrl) =>
             new Uri((baseUrl ?? "").TrimEnd('/') + "/");
 
@@ -58,7 +85,8 @@ namespace Emby.InvidiousPlugin
             code == HttpStatusCode.ServiceUnavailable ||
             code == HttpStatusCode.GatewayTimeout;
 
-        private static async Task<JsonDocument> GetJsonAsync(string baseUrl, string relativePath, CancellationToken ct)
+        private static async Task<JsonDocument> GetJsonAsync(
+            string baseUrl, string relativePath, CancellationToken ct)
         {
             HttpStatusCode lastStatus = 0;
 
@@ -67,62 +95,99 @@ namespace Emby.InvidiousPlugin
                 if (attempt > 0)
                     await Task.Delay(RetryDelaysMs[attempt - 1], ct).ConfigureAwait(false);
 
+                // ── Rate Limit vor jedem Call ──
+                await ThrottleAsync(ct).ConfigureAwait(false);
+
                 using var req = CreateGetRequest(baseUrl, relativePath);
-                using var resp = await Http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+                using var resp = await Http.SendAsync(
+                    req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
 
                 if (resp.IsSuccessStatusCode)
                 {
-                    await using var stream = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-                    return await JsonDocument.ParseAsync(stream, cancellationToken: ct).ConfigureAwait(false);
+                    await using var stream = await resp.Content
+                        .ReadAsStreamAsync(ct).ConfigureAwait(false);
+                    return await JsonDocument.ParseAsync(
+                        stream, cancellationToken: ct).ConfigureAwait(false);
                 }
 
                 lastStatus = resp.StatusCode;
+
+                // ── NEU: bei 429 (Too Many Requests) extra lang warten ──
+                if (lastStatus == HttpStatusCode.TooManyRequests)
+                {
+                    var retryAfter = 5000 + (attempt * 3000); // 5s, 8s, 11s
+                    Debug.WriteLine(
+                        $"[InvidiousApi] Rate limited (429), waiting {retryAfter}ms...");
+                    await Task.Delay(retryAfter, ct).ConfigureAwait(false);
+                    continue;
+                }
+
                 if (!IsTransientError(lastStatus))
                     break;
             }
 
-            throw new HttpRequestException($"Invidious returned HTTP {(int)lastStatus} for: {relativePath}");
+            throw new HttpRequestException(
+                $"Invidious returned HTTP {(int)lastStatus} for: {relativePath}");
         }
 
-        private static async Task<JsonDocument?> TryGetJsonAsync(string baseUrl, string relativePath, CancellationToken ct)
+        private static async Task<JsonDocument?> TryGetJsonAsync(
+            string baseUrl, string relativePath, CancellationToken ct)
         {
-            try { return await GetJsonAsync(baseUrl, relativePath, ct).ConfigureAwait(false); }
+            try
+            {
+                return await GetJsonAsync(baseUrl, relativePath, ct).ConfigureAwait(false);
+            }
             catch (Exception ex)
             {
-                Debug.WriteLine($"[InvidiousApi] TryGetJsonAsync failed for {relativePath}: {ex.GetType().Name}: {ex.Message}");
+                Debug.WriteLine(
+                    $"[InvidiousApi] TryGetJsonAsync failed for {relativePath}: " +
+                    $"{ex.GetType().Name}: {ex.Message}");
                 return null;
             }
         }
 
-        public static async Task<(string? id, string? name, string? thumb)> GetChannelDetailsAsync(
-            string baseUrl, string query, bool isHandle, CancellationToken ct)
+        // ── Alle anderen Methoden bleiben identisch ──
+
+        public static async Task<(string? id, string? name, string? thumb)>
+            GetChannelDetailsAsync(
+                string baseUrl, string query, bool isHandle, CancellationToken ct)
         {
             try
             {
                 if (isHandle)
                 {
                     var q = Uri.EscapeDataString(query);
-                    using var doc = await TryGetJsonAsync(baseUrl, $"api/v1/search?q={q}&type=channel", ct).ConfigureAwait(false);
+                    using var doc = await TryGetJsonAsync(
+                        baseUrl, $"api/v1/search?q={q}&type=channel", ct)
+                        .ConfigureAwait(false);
                     if (doc == null) return (null, null, null);
                     var root = doc.RootElement;
                     if (root.ValueKind == JsonValueKind.Array && root.GetArrayLength() > 0)
                     {
                         var first = root[0];
-                        return (GetString(first, "authorId"), GetString(first, "author"), GetHighestResThumb(first, "authorThumbnails"));
+                        return (
+                            GetString(first, "authorId"),
+                            GetString(first, "author"),
+                            GetHighestResThumb(first, "authorThumbnails"));
                     }
                 }
                 else
                 {
                     var id = Uri.EscapeDataString(query);
-                    using var doc = await TryGetJsonAsync(baseUrl, $"api/v1/channels/{id}", ct).ConfigureAwait(false);
+                    using var doc = await TryGetJsonAsync(
+                        baseUrl, $"api/v1/channels/{id}", ct).ConfigureAwait(false);
                     if (doc == null) return (null, null, null);
                     var root = doc.RootElement;
-                    return (id, GetString(root, "author"), GetHighestResThumb(root, "authorThumbnails"));
+                    return (id,
+                        GetString(root, "author"),
+                        GetHighestResThumb(root, "authorThumbnails"));
                 }
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"[InvidiousApi] GetChannelDetailsAsync failed for '{query}': {ex.GetType().Name}: {ex.Message}");
+                Debug.WriteLine(
+                    $"[InvidiousApi] GetChannelDetailsAsync failed for '{query}': " +
+                    $"{ex.GetType().Name}: {ex.Message}");
             }
             return (null, null, null);
         }
@@ -133,26 +198,34 @@ namespace Emby.InvidiousPlugin
             try
             {
                 var escId = Uri.EscapeDataString(id);
-                using var doc = await TryGetJsonAsync(baseUrl, $"api/v1/playlists/{escId}", ct).ConfigureAwait(false);
+                using var doc = await TryGetJsonAsync(
+                    baseUrl, $"api/v1/playlists/{escId}", ct).ConfigureAwait(false);
                 if (doc == null) return (null, null);
                 var root = doc.RootElement;
-                var thumb = GetString(root, "playlistThumbnail") ?? GetHighestResThumb(root, "playlistThumbnails");
+                var thumb = GetString(root, "playlistThumbnail")
+                            ?? GetHighestResThumb(root, "playlistThumbnails");
                 return (GetString(root, "title"), thumb);
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"[InvidiousApi] GetPlaylistDetailsAsync failed for '{id}': {ex.GetType().Name}: {ex.Message}");
+                Debug.WriteLine(
+                    $"[InvidiousApi] GetPlaylistDetailsAsync failed for '{id}': " +
+                    $"{ex.GetType().Name}: {ex.Message}");
             }
             return (null, null);
         }
 
-        public static Task<JsonDocument> SearchVideosAsync(string baseUrl, string query, int page, CancellationToken ct)
+        public static Task<JsonDocument> SearchVideosAsync(
+            string baseUrl, string query, int page, CancellationToken ct)
         {
             var q = Uri.EscapeDataString(query ?? "");
-            return GetJsonAsync(baseUrl, $"api/v1/search?q={q}&type=video&page={page}", ct);
+            return GetJsonAsync(baseUrl,
+                $"api/v1/search?q={q}&type=video&page={page}", ct);
         }
 
-        public static Task<JsonDocument> GetTrendingAsync(string baseUrl, string? category, CancellationToken ct, string? region = null)
+        public static Task<JsonDocument> GetTrendingAsync(
+            string baseUrl, string? category, CancellationToken ct,
+            string? region = null)
         {
             var parts = new List<string>();
             if (!string.IsNullOrEmpty(category))
@@ -164,16 +237,20 @@ namespace Emby.InvidiousPlugin
             return GetJsonAsync(baseUrl, path, ct);
         }
 
-        public static Task<JsonDocument> GetPopularAsync(string baseUrl, CancellationToken ct)
+        public static Task<JsonDocument> GetPopularAsync(
+            string baseUrl, CancellationToken ct)
         {
             return GetJsonAsync(baseUrl, "api/v1/popular", ct);
         }
 
-        public static Task<JsonDocument> GetChannelVideosAsync(string baseUrl, string channelId, int page, CancellationToken ct, string sortBy = "newest")
+        public static Task<JsonDocument> GetChannelVideosAsync(
+            string baseUrl, string channelId, int page,
+            CancellationToken ct, string sortBy = "newest")
         {
             var id = Uri.EscapeDataString(channelId ?? "");
             var sort = NormalizeSortBy(sortBy);
-            return GetJsonAsync(baseUrl, $"api/v1/channels/{id}/videos?page={page}&sort_by={sort}", ct);
+            return GetJsonAsync(baseUrl,
+                $"api/v1/channels/{id}/videos?page={page}&sort_by={sort}", ct);
         }
 
         private static string NormalizeSortBy(string sortBy)
@@ -186,19 +263,23 @@ namespace Emby.InvidiousPlugin
             };
         }
 
-        public static Task<JsonDocument> GetPlaylistVideosAsync(string baseUrl, string playlistId, int page, CancellationToken ct)
+        public static Task<JsonDocument> GetPlaylistVideosAsync(
+            string baseUrl, string playlistId, int page, CancellationToken ct)
         {
             var id = Uri.EscapeDataString(playlistId ?? "");
-            return GetJsonAsync(baseUrl, $"api/v1/playlists/{id}?page={page}", ct);
+            return GetJsonAsync(baseUrl,
+                $"api/v1/playlists/{id}?page={page}", ct);
         }
 
-        public static Task<JsonDocument> GetVideoAsync(string baseUrl, string videoId, CancellationToken ct)
+        public static Task<JsonDocument> GetVideoAsync(
+            string baseUrl, string videoId, CancellationToken ct)
         {
             var id = Uri.EscapeDataString(videoId ?? "");
             return GetJsonAsync(baseUrl, $"api/v1/videos/{id}", ct);
         }
 
-        public static Task<JsonDocument?> TryGetVideoAsync(string baseUrl, string videoId, CancellationToken ct)
+        public static Task<JsonDocument?> TryGetVideoAsync(
+            string baseUrl, string videoId, CancellationToken ct)
         {
             var id = Uri.EscapeDataString(videoId ?? "");
             return TryGetJsonAsync(baseUrl, $"api/v1/videos/{id}", ct);
@@ -223,14 +304,17 @@ namespace Emby.InvidiousPlugin
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"[InvidiousApi] GetCleanBaseUrl parse failed: {ex.Message}");
+                Debug.WriteLine(
+                    $"[InvidiousApi] GetCleanBaseUrl parse failed: {ex.Message}");
                 return (baseUrl ?? "").TrimEnd('/');
             }
         }
 
-        public static string? GetHighestResThumb(JsonElement el, string propertyName)
+        public static string? GetHighestResThumb(
+            JsonElement el, string propertyName)
         {
-            if (!el.TryGetProperty(propertyName, out var arr) || arr.ValueKind != JsonValueKind.Array)
+            if (!el.TryGetProperty(propertyName, out var arr)
+                || arr.ValueKind != JsonValueKind.Array)
                 return null;
 
             string? bestUrl = null;
@@ -241,7 +325,6 @@ namespace Emby.InvidiousPlugin
                 var url = GetString(thumb, "url");
                 if (string.IsNullOrWhiteSpace(url)) continue;
                 url = RewriteThumbnailUrl(url);
-
                 var w = GetInt(thumb, "width") ?? 0;
                 if (w >= bestWidth) { bestWidth = w; bestUrl = url; }
             }
@@ -254,12 +337,14 @@ namespace Emby.InvidiousPlugin
             if (url.StartsWith("//")) url = "https:" + url;
 
             var ggphtIdx = url.IndexOf("/ggpht/", StringComparison.Ordinal);
-            if (ggphtIdx >= 0 && !url.Contains("yt3.ggpht.com", StringComparison.Ordinal))
+            if (ggphtIdx >= 0
+                && !url.Contains("yt3.ggpht.com", StringComparison.Ordinal))
                 url = "https://yt3.ggpht.com" + url.Substring(ggphtIdx + 6);
 
             var viIdx = url.IndexOf("/vi/", StringComparison.Ordinal);
-            if (viIdx >= 0 && !url.Contains("i.ytimg.com", StringComparison.Ordinal)
-                           && !url.Contains("yt3.ggpht.com", StringComparison.Ordinal))
+            if (viIdx >= 0
+                && !url.Contains("i.ytimg.com", StringComparison.Ordinal)
+                && !url.Contains("yt3.ggpht.com", StringComparison.Ordinal))
                 url = "https://i.ytimg.com" + url.Substring(viIdx);
 
             return url;
@@ -277,7 +362,8 @@ namespace Emby.InvidiousPlugin
             if (el.ValueKind != JsonValueKind.Object) return null;
             if (!el.TryGetProperty(name, out var p)) return null;
             if (p.ValueKind == JsonValueKind.Number && p.TryGetInt32(out var i)) return i;
-            if (p.ValueKind == JsonValueKind.String && int.TryParse(p.GetString(), out var s)) return s;
+            if (p.ValueKind == JsonValueKind.String
+                && int.TryParse(p.GetString(), out var s)) return s;
             return null;
         }
 
@@ -286,7 +372,8 @@ namespace Emby.InvidiousPlugin
             if (el.ValueKind != JsonValueKind.Object) return null;
             if (!el.TryGetProperty(name, out var p)) return null;
             if (p.ValueKind == JsonValueKind.Number && p.TryGetInt64(out var i)) return i;
-            if (p.ValueKind == JsonValueKind.String && long.TryParse(p.GetString(), out var s)) return s;
+            if (p.ValueKind == JsonValueKind.String
+                && long.TryParse(p.GetString(), out var s)) return s;
             return null;
         }
     }

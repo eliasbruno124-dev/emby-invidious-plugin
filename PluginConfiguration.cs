@@ -85,5 +85,13 @@ namespace Emby.InvidiousPlugin
             "Recommended: 3 days. Higher values save bandwidth but use more disk space.")]
         [Range(0, 30)]
         public int CacheDays { get; set; } = 3;
+
+        [DisplayName("Max Concurrent FFmpeg Muxes")]
+        [Description(
+            "Maximum number of FFmpeg HLS mux processes that can run simultaneously.\n" +
+            "Higher values allow more parallel streams but use more CPU and RAM.\n" +
+            "Set to 0 for unlimited. Default: 4.")]
+        [Range(0, 32)]
+        public int MaxConcurrentMuxes { get; set; } = 4;
     }
 }
