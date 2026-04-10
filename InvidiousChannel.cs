@@ -953,15 +953,16 @@ namespace Emby.InvidiousPlugin
         }
 
         // ────────────────────────────────────────────────────────────
-        //  Kurzer Wait: max 2s, pollt alle 200ms ob mindestens
-        //  1 Segment in playback.m3u8 steht → sofort abspielen.
-        //  Gibt immer zurück — blockiert nie länger als 2s.
+        //  Kurzer Wait: max 5s, pollt alle 250ms ob mindestens
+        //  3 Segmente in playback.m3u8 stehen → stabiler Start.
+        //  Gibt immer zurück — blockiert nie länger als 5s.
         // ────────────────────────────────────────────────────────────
         private static async Task QuickWaitForFirstSegment(
             string playbackPath, CancellationToken ct)
         {
-            const int maxMs = 4500;
-            const int pollMs = 200;
+            const int maxMs = 5000;
+            const int pollMs = 250;
+            const int minSegments = 3;
             int waited = 0;
 
             while (waited < maxMs)
@@ -975,20 +976,22 @@ namespace Emby.InvidiousPlugin
                     if (File.Exists(playbackPath))
                     {
                         var content = File.ReadAllText(playbackPath);
+                        int count = 0;
                         foreach (var line in content.Split('\n'))
                         {
                             var t = line.Trim();
                             if (t.EndsWith(".ts", StringComparison.Ordinal)
                                 || t.EndsWith(".m4s", StringComparison.Ordinal))
-                                return; // Mindestens 1 Segment → ready
+                                count++;
                         }
+                        if (count >= minSegments)
+                            return;
                     }
                 }
                 catch { }
             }
             // Timeout → trotzdem zurückkehren, Emby bekommt die Source
         }
-
 
         private static MediaSourceInfo BuildReelSource(
             string videoId, string itag, string label,
