@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -52,6 +53,7 @@ namespace Emby.InvidiousPlugin
         private const int RunningProcessWaitMaxIterations = 120;
         private const int PollIntervalMs = 400;           // war 500 → schnellere Reaktion
         private const int PlaybackUpdateIntervalMs = 800;  // war 1000 → häufigere Updates
+        private const int IdleTimeoutMs = 60_000;          // 60s ohne Segment-Zugriff → FFmpeg stoppen
 
         static MuxHelper()
         {
@@ -130,15 +132,39 @@ namespace Emby.InvidiousPlugin
             var videoDir = Path.Combine(CacheDir, $"{videoId}_{height}p");
             var m3u8 = Path.Combine(videoDir, "stream.m3u8");
             var playback = Path.Combine(videoDir, "playback.m3u8");
+            var idleMarker = Path.Combine(videoDir, "idle_stopped");
             try
             {
-                if (!File.Exists(m3u8)) return null;
+                if (!File.Exists(m3u8))
+                {
+                    Log($"GetCachedStreamPath: {videoId}_{height}p — no stream.m3u8");
+                    return null;
+                }
                 var age = DateTime.UtcNow - File.GetLastWriteTimeUtc(m3u8);
-                if (age.TotalDays > GetCacheDays()) return null;
+                if (age.TotalDays > GetCacheDays())
+                {
+                    Log($"GetCachedStreamPath: {videoId}_{height}p — cache expired ({age.TotalDays:F1}d)");
+                    return null;
+                }
+
+                // Partieller Cache (idle-gestoppt) → null zurückgeben
+                // damit MuxToHlsAsync die Resume-Logik ausführt
+                if (File.Exists(idleMarker))
+                {
+                    Log($"GetCachedStreamPath: {videoId}_{height}p — idle_stopped marker found → returning null for resume");
+                    return null;
+                }
+
                 var content = File.ReadAllText(m3u8);
-                if (content.Contains("#EXT-X-ENDLIST")
-                    && CountSegments(content) >= MinSegmentsForCache)
-                    return File.Exists(playback) ? playback : m3u8;
+                bool hasEndlist = content.Contains("#EXT-X-ENDLIST");
+                int segs = CountSegments(content);
+                if (hasEndlist && segs >= MinSegmentsForCache)
+                {
+                    var result = File.Exists(playback) ? playback : m3u8;
+                    Log($"GetCachedStreamPath: {videoId}_{height}p — complete cache ({segs} segs) → {Path.GetFileName(result)}");
+                    return result;
+                }
+                Log($"GetCachedStreamPath: {videoId}_{height}p — incomplete (endlist={hasEndlist}, segs={segs})");
             }
             catch (Exception ex)
             {
@@ -151,8 +177,12 @@ namespace Emby.InvidiousPlugin
                 try
                 {
                     var content = File.ReadAllText(playback);
-                    if (CountSegments(content) >= MinSegmentsForPlayback)
+                    int segs = CountSegments(content);
+                    if (segs >= MinSegmentsForPlayback)
+                    {
+                        Log($"GetCachedStreamPath: {videoId}_{height}p — running process, {segs} segs ready");
                         return playback;
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -160,7 +190,33 @@ namespace Emby.InvidiousPlugin
                 }
             }
 
+            Log($"GetCachedStreamPath: {videoId}_{height}p — returning null");
             return null;
+        }
+
+        /// <summary>
+        /// Bereitet playback.m3u8 für Resume vor: entfernt ENDLIST damit
+        /// Emby die Datei als wachsenden Stream behandelt.
+        /// </summary>
+        public static void PrepareForResume(string videoId, int height)
+        {
+            var videoDir = Path.Combine(CacheDir, $"{videoId}_{height}p");
+            var playback = Path.Combine(videoDir, "playback.m3u8");
+            try
+            {
+                if (!File.Exists(playback)) return;
+                var content = File.ReadAllText(playback);
+                if (content.Contains("#EXT-X-ENDLIST"))
+                {
+                    content = content.Replace("#EXT-X-ENDLIST", "").TrimEnd() + "\n";
+                    File.WriteAllText(playback, content);
+                    Log($"PrepareForResume: Removed ENDLIST from {videoId}_{height}p playback.m3u8");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"PrepareForResume error: {ex.Message}");
+            }
         }
 
         public static string PreparePlaybackPath(string videoId, int height)
@@ -222,6 +278,149 @@ namespace Emby.InvidiousPlugin
             catch (Exception ex) { Log($"UpdatePlaybackM3u8 error: {ex.Message}"); }
         }
 
+        // ────────────────────────────────────────────────────────────
+        //  Segment-Equalization: Die schnellere Qualität wird sofort
+        //  gestoppt. Die langsamere muxt alleine weiter bis sie den
+        //  gleichen Segment-Stand erreicht hat, dann wird sie auch gestoppt.
+        // ────────────────────────────────────────────────────────────
+        private static async Task EqualizeBeforeStop(string videoId, string triggeringKey)
+        {
+            // Alle laufenden Prozesse für dieses Video finden
+            var siblings = new List<(string key, int segs)>();
+            foreach (var kvp in RunningProcesses)
+            {
+                if (!kvp.Key.StartsWith(videoId + "_", StringComparison.Ordinal))
+                    continue;
+
+                var dir = Path.Combine(CacheDir, kvp.Key);
+                var m3u8 = Path.Combine(dir, "stream.m3u8");
+                int segs = 0;
+                try
+                {
+                    if (File.Exists(m3u8))
+                        segs = CountSegments(File.ReadAllText(m3u8));
+                }
+                catch { }
+                siblings.Add((kvp.Key, segs));
+            }
+
+            if (siblings.Count < 2)
+            {
+                Log($"Equalize: Only 1 quality running for {videoId}, skipping");
+                return;
+            }
+
+            int maxSegs = siblings.Max(s => s.segs);
+            // Triggernde Qualität NICHT sofort stoppen — ihr Watchdog läuft noch
+            // und muss die Equalization zu Ende führen
+            var ahead = siblings
+                .Where(s => s.segs >= maxSegs && s.key != triggeringKey)
+                .ToList();
+            var behind = siblings
+                .Where(s => s.segs < maxSegs && s.key != triggeringKey)
+                .ToList();
+
+            // ── Schnellere Qualität(en) sofort stoppen ──
+            foreach (var (key, segs) in ahead)
+            {
+                Log($"Equalize: Stopping faster quality {key} ({segs} segs)");
+                StopAndMarkIdle(key);
+            }
+
+            if (behind.Count == 0)
+            {
+                Log($"Equalize: All {siblings.Count} qualities at {maxSegs} segs, nothing more to do");
+                return;
+            }
+
+            // ── Langsamere Qualität(en) weiter muxen lassen bis sie aufgeholt haben (unbegrenzt) ──
+            foreach (var (key, segs) in behind)
+                Log($"Equalize: {key} has {segs}/{maxSegs} segs — waiting until caught up");
+
+            const int pollMs = 1000;
+            var pendingKeys = new HashSet<string>(behind.Select(b => b.key));
+
+            while (pendingKeys.Count > 0)
+            {
+                await Task.Delay(pollMs).ConfigureAwait(false);
+
+                foreach (var key in pendingKeys.ToList())
+                {
+                    if (!RunningProcesses.TryGetValue(key, out var proc))
+                    {
+                        // Prozess schon beendet (fertig oder Fehler)
+                        pendingKeys.Remove(key);
+                        continue;
+                    }
+                    try { if (proc.HasExited) { pendingKeys.Remove(key); continue; } }
+                    catch { pendingKeys.Remove(key); continue; }
+
+                    var dir = Path.Combine(CacheDir, key);
+                    var m3u8 = Path.Combine(dir, "stream.m3u8");
+                    int currentSegs = 0;
+                    try
+                    {
+                        if (File.Exists(m3u8))
+                            currentSegs = CountSegments(File.ReadAllText(m3u8));
+                    }
+                    catch { }
+
+                    if (currentSegs >= maxSegs)
+                    {
+                        // Ziel erreicht → sofort stoppen damit nicht weiter gemuxt wird
+                        Log($"Equalize: {key} reached {currentSegs}/{maxSegs} segs — stopping now");
+                        StopAndMarkIdle(key);
+                        pendingKeys.Remove(key);
+                    }
+                }
+            }
+
+            Log($"Equalize: All qualities for {videoId} equalized");
+        }
+
+        /// <summary>
+        /// Stoppt einen einzelnen FFmpeg-Prozess und schreibt den idle_stopped Marker.
+        /// </summary>
+        private static void StopAndMarkIdle(string processKey)
+        {
+            if (!RunningProcesses.TryRemove(processKey, out var proc))
+                return;
+
+            try { if (!proc.HasExited) proc.Kill(); }
+            catch { }
+
+            try
+            {
+                var dir = Path.Combine(CacheDir, processKey);
+                var m3u8 = Path.Combine(dir, "stream.m3u8");
+                var playbackPath = Path.Combine(dir, "playback.m3u8");
+                var idleMarker = Path.Combine(dir, "idle_stopped");
+
+                int segs = 0;
+                if (File.Exists(m3u8))
+                    segs = CountSegments(File.ReadAllText(m3u8));
+
+                File.WriteAllText(idleMarker, $"{DateTime.UtcNow:O}\n{segs}");
+
+                UpdatePlaybackM3u8(m3u8, playbackPath);
+                if (File.Exists(playbackPath))
+                {
+                    var pc = File.ReadAllText(playbackPath);
+                    if (!pc.Contains("#EXT-X-ENDLIST"))
+                        File.WriteAllText(playbackPath, pc + "\n#EXT-X-ENDLIST\n");
+                }
+
+                Log($"StopAndMarkIdle: {processKey} stopped ({segs} segs)");
+            }
+            catch (Exception ex)
+            {
+                Log($"StopAndMarkIdle error for {processKey}: {ex.Message}");
+            }
+
+            MuxGate.Release();
+            try { proc.Dispose(); } catch { }
+        }
+
         private static int CountSegments(string content)
         {
             int count = 0;
@@ -238,6 +437,7 @@ namespace Emby.InvidiousPlugin
         public static async Task<string?> MuxToHlsAsync(
             string directVideoUrl, string directAudioUrl,
             string videoId, int height, bool isVp9 = false,
+            string? authHeader = null,
             CancellationToken ct = default)
         {
             var processKey = $"{videoId}_{height}p";
@@ -309,6 +509,8 @@ namespace Emby.InvidiousPlugin
                     if (age.TotalDays < GetCacheDays())
                     {
                         var cached = File.ReadAllText(m3u8);
+
+                        // Vollständiger Cache → sofort zurückgeben
                         if (cached.Contains("#EXT-X-ENDLIST")
                             && CountSegments(cached) >= MinSegmentsForCache)
                         {
@@ -316,12 +518,31 @@ namespace Emby.InvidiousPlugin
                             UpdatePlaybackM3u8(m3u8, playback);
                             return File.Exists(playback) ? playback : m3u8;
                         }
-                        Log($"Cache stale ({CountSegments(cached)} segs), re-muxing");
+
+                        // Partieller Cache (idle-gestoppt) → Resume vorbereiten
+                        var idleMarker = Path.Combine(videoDir, "idle_stopped");
+                        if (File.Exists(idleMarker) && CountSegments(cached) >= MinSegmentsForCache)
+                        {
+                            Log($"RESUME: Found partial cache ({CountSegments(cached)} segs) for {processKey}");
+                            // Nicht löschen — weiter unten wird mit -ss fortgesetzt
+                        }
+                        else
+                        {
+                            Log($"Cache stale ({CountSegments(cached)} segs), re-muxing from scratch");
+                            try { Directory.Delete(videoDir, true); }
+                            catch (Exception ex)
+                            {
+                                Log($"Cache dir cleanup error: {ex.Message}");
+                            }
+                        }
                     }
-                    try { Directory.Delete(videoDir, true); }
-                    catch (Exception ex)
+                    else
                     {
-                        Log($"Cache dir cleanup error: {ex.Message}");
+                        try { Directory.Delete(videoDir, true); }
+                        catch (Exception ex)
+                        {
+                            Log($"Cache dir cleanup error: {ex.Message}");
+                        }
                     }
                 }
 
@@ -340,34 +561,85 @@ namespace Emby.InvidiousPlugin
                     var ffmpeg = FindFfmpeg();
 
                     string segExt = isVp9 ? "m4s" : "ts";
+
+                    // ── Resume-Erkennung ──
+                    int startNumber = 0;
+                    string seekArg = "";
+                    var idleMarkerPath = Path.Combine(videoDir, "idle_stopped");
+
+                    if (File.Exists(idleMarkerPath) && File.Exists(m3u8))
+                    {
+                        var existingContent = File.ReadAllText(m3u8);
+                        int existingSegs = CountSegments(existingContent);
+                        double existingDuration = ParseTotalDuration(existingContent);
+
+                        if (existingSegs >= MinSegmentsForCache && existingDuration > 0)
+                        {
+                            startNumber = existingSegs;
+                            // 2s Overlap für sauberen Übergang
+                            double seekSec = Math.Max(0, existingDuration - 2);
+                            seekArg = $"-ss {seekSec:F2} ";
+                            Log($"RESUME: Starting at seg {startNumber}, seeking to {seekSec:F1}s (total cached: {existingDuration:F1}s)");
+
+                            // Idle-Marker löschen
+                            try { File.Delete(idleMarkerPath); } catch { }
+
+                            // #EXT-X-ENDLIST aus stream.m3u8 entfernen falls vorhanden
+                            // und #EXT-X-DISCONTINUITY einfügen → signalisiert Emby
+                            // dass sich Timestamps/Codecs ändern können (kein Stottern)
+                            if (existingContent.Contains("#EXT-X-ENDLIST"))
+                            {
+                                existingContent = existingContent.Replace("#EXT-X-ENDLIST", "").TrimEnd();
+                            }
+                            existingContent += "\n#EXT-X-DISCONTINUITY\n";
+                            File.WriteAllText(m3u8, existingContent);
+                        }
+                        else
+                        {
+                            try { File.Delete(idleMarkerPath); } catch { }
+                        }
+                    }
+
                     var segPattern = Path.Combine(videoDir, $"seg_%04d.{segExt}");
 
-                    // ── VERBESSERT: Buffer-Einstellungen gegen Stottern ──
-                    // -probesize 10M: mehr Daten analysieren vor Start
-                    // -analyzeduration 5M: längere Analyse
-                    // -hls_time 4: kürzere Segmente = schnellerer Start
-                    // -hls_init_time 2: erstes Segment klein halten
                     string codecArgs = isVp9
                         ? "-c:v copy -c:a copy -hls_segment_type fmp4"
                         : "-c:v copy -c:a copy -bsf:v h264_mp4toannexb";
 
+                    // ── Speed-Optimierungen ──
+                    // -headers: Basic Auth für Invidious-Proxy
+                    // -thread_queue_size 4096: größerer Input-Buffer pro Stream
+                    // -fflags +nobuffer: kein interner Buffering-Delay
+                    // -flags low_delay: minimale Latenz
+                    // -hls_init_time 1: erstes Segment in ~1s fertig
+                    // -hls_time 4: weitere Segmente à 4s
+                    string headersArg = !string.IsNullOrEmpty(authHeader)
+                        ? $"-headers \"Authorization: {authHeader}\r\n\" "
+                        : "";
+
                     var args =
                         $"-y " +
                         $"-probesize 10M -analyzeduration 5M " +
+                        $"{seekArg}" +
                         $"-reconnect 1 -reconnect_streamed 1 " +
                         $"-reconnect_delay_max 5 " +
+                        $"-thread_queue_size 4096 " +
+                        $"{headersArg}" +
                         $"-i \"{directVideoUrl}\" " +
+                        $"{seekArg}" +
                         $"-reconnect 1 -reconnect_streamed 1 " +
                         $"-reconnect_delay_max 5 " +
+                        $"-thread_queue_size 4096 " +
+                        $"{headersArg}" +
                         $"-i \"{directAudioUrl}\" " +
                         $"-map 0:v:0 -map 1:a:0 " +
                         $"-fflags +genpts+discardcorrupt " +
                         $"-avoid_negative_ts make_zero " +
                         $"-max_muxing_queue_size 4096 " +
                         $"{codecArgs} " +
-                        $"-f hls -hls_time 4 -hls_init_time 2 " +
+                        $"-f hls -hls_time 4 " +
                         $"-hls_list_size 0 -hls_flags append_list " +
-                        $"-start_number 0 " +
+                        $"-start_number {startNumber} " +
                         $"-hls_segment_filename \"{segPattern}\" \"{m3u8}\"";
 
                     Log($"Starting FFmpeg: {ffmpeg}");
@@ -444,17 +716,63 @@ namespace Emby.InvidiousPlugin
                                 }
                             }
 
-                            RunningProcesses.TryRemove(processKey, out _);
-                            MuxGate.Release();
+                            var wasRemoved = RunningProcesses.TryRemove(processKey, out _);
+                            // Nur releasen wenn WIR den Prozess entfernt haben
+                            // (nicht wenn der Idle-Watchdog es schon getan hat)
+                            if (wasRemoved) MuxGate.Release();
                             try { process.Dispose(); } catch { }
                         }
                     });
 
                     _ = Task.Run(async () =>
                     {
+                        int lastSegCount = 0;
+                        DateTime lastNewSegTime = DateTime.UtcNow;
+
                         while (RunningProcesses.ContainsKey(processKey))
                         {
                             UpdatePlaybackM3u8(m3u8, playback);
+
+                            try
+                            {
+                                int currentSegs = 0;
+                                if (File.Exists(m3u8))
+                                    currentSegs = CountSegments(File.ReadAllText(m3u8));
+
+                                if (currentSegs > lastSegCount)
+                                {
+                                    lastSegCount = currentSegs;
+                                    lastNewSegTime = DateTime.UtcNow;
+                                }
+
+                                // ── Stall-Detection (60s keine neuen Segmente) ──
+                                if ((DateTime.UtcNow - lastNewSegTime).TotalMilliseconds >= IdleTimeoutMs)
+                                {
+                                    // FFmpeg schreibt keine neuen Segmente mehr
+                                    bool processStillRunning = false;
+                                    if (RunningProcesses.TryGetValue(processKey, out var checkProc))
+                                    {
+                                        try { processStillRunning = !checkProc.HasExited; }
+                                        catch { }
+                                    }
+
+                                    if (!processStillRunning)
+                                        break;
+
+                                    Log($"IDLE: No new segments for {IdleTimeoutMs / 1000}s ({currentSegs} segs), equalizing {processKey}");
+
+                                    await EqualizeBeforeStop(videoId, processKey).ConfigureAwait(false);
+
+                                    Log($"IDLE: Equalization done for {videoId}");
+                                    StopAndMarkIdle(processKey);
+                                    break;
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                Log($"Idle-check error for {processKey}: {ex.Message}");
+                            }
+
                             await Task.Delay(PlaybackUpdateIntervalMs).ConfigureAwait(false);
                         }
                         UpdatePlaybackM3u8(m3u8, playback);
@@ -527,6 +845,26 @@ namespace Emby.InvidiousPlugin
                 Log($"EXCEPTION in MuxToHlsAsync: {ex.GetType().Name}: {ex.Message}");
                 return null;
             }
+        }
+
+        private static double ParseTotalDuration(string m3u8Content)
+        {
+            double total = 0;
+            foreach (var line in m3u8Content.Split('\n'))
+            {
+                var t = line.Trim();
+                if (t.StartsWith("#EXTINF:", StringComparison.Ordinal))
+                {
+                    // Format: #EXTINF:4.000000, or #EXTINF:4.000,
+                    var val = t.Substring(8);
+                    var commaIdx = val.IndexOf(',');
+                    if (commaIdx > 0) val = val.Substring(0, commaIdx);
+                    if (double.TryParse(val, System.Globalization.NumberStyles.Float,
+                        System.Globalization.CultureInfo.InvariantCulture, out var dur))
+                        total += dur;
+                }
+            }
+            return total;
         }
 
         private static string FindFfmpeg()

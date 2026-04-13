@@ -48,7 +48,7 @@ namespace Emby.InvidiousPlugin
             "ISO 3166-1 country code for YouTube trending results.\n" +
             "Examples: DE (Germany), US (USA), AT (Austria), CH (Switzerland), GB (UK), FR (France).\n" +
             "Leave empty for Invidious default.")]
-        public string TrendingRegion { get; set; } = "US";
+        public string TrendingRegion { get; set; } = "DE";
 
         // ─────────────────────────────────────────────────────────────────────
         // SORTING
@@ -75,6 +75,25 @@ namespace Emby.InvidiousPlugin
         public int MaxSearchVideos { get; set; } = 50;
 
         // ─────────────────────────────────────────────────────────────────────
+        // QUALITY
+        // ─────────────────────────────────────────────────────────────────────
+
+        [DisplayName("Enable 4K (2160p)")]
+        [Description(
+            "Enable 4K video quality. When disabled, the maximum HLS quality is 1080p.\n" +
+            "Disable this on hardware-weak systems to save CPU and bandwidth,\n" +
+            "as 4K VP9 muxing is significantly more demanding.")]
+        public bool Enable4K { get; set; } = true;
+
+        [DisplayName("Max Concurrent Muxes")]
+        [Description(
+            "Maximum number of FFmpeg mux processes running at the same time.\n" +
+            "Lower values save CPU/RAM, higher values allow more parallel streams.\n" +
+            "Set to 0 for unlimited. Recommended: 4.")]
+        [Range(0, 64)]
+        public int MaxConcurrentMuxes { get; set; } = 4;
+
+        // ─────────────────────────────────────────────────────────────────────
         // CACHING
         // ─────────────────────────────────────────────────────────────────────
 
@@ -85,13 +104,5 @@ namespace Emby.InvidiousPlugin
             "Recommended: 3 days. Higher values save bandwidth but use more disk space.")]
         [Range(0, 30)]
         public int CacheDays { get; set; } = 3;
-
-        [DisplayName("Max Concurrent FFmpeg Muxes")]
-        [Description(
-            "Maximum number of FFmpeg HLS mux processes that can run simultaneously.\n" +
-            "Higher values allow more parallel streams but use more CPU and RAM.\n" +
-            "Set to 0 for unlimited. Default: 4.")]
-        [Range(0, 32)]
-        public int MaxConcurrentMuxes { get; set; } = 0;
     }
 }
