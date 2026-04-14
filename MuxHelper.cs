@@ -17,6 +17,41 @@ namespace Emby.InvidiousPlugin
 
         private static readonly ConcurrentDictionary<string, Process> RunningProcesses = new();
 
+        private const int SessionCheckMs = 2000;   // alle 2s Session prüfen
+        private const int SessionGraceMs = 30_000;  // 30s ohne Session → Stop
+
+        /// <summary>
+        /// Prüft ob irgendeine Emby-Session gerade dieses Video abspielt.
+        /// </summary>
+        private static bool IsVideoBeingPlayed(string videoId)
+        {
+            try
+            {
+                var sm = Plugin.SessionManager;
+                if (sm == null) return false;
+
+                foreach (var session in sm.Sessions)
+                {
+                    var item = session.NowPlayingItem;
+                    if (item != null)
+                    {
+                        var path = item.Path ?? "";
+                        if (path.Contains(videoId, StringComparison.OrdinalIgnoreCase))
+                            return true;
+                    }
+
+                    var sourceId = session.PlayState?.MediaSourceId ?? "";
+                    if (sourceId.Contains(videoId, StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"IsVideoBeingPlayed error: {ex.Message}");
+            }
+            return false;
+        }
+
         // Dynamisch konfigurierbar — 0 = unlimited
         private static SemaphoreSlim MuxGate = new(4, 4);
         private static int _currentMuxLimit = 4;
@@ -62,7 +97,52 @@ namespace Emby.InvidiousPlugin
             Log("=== MuxHelper initialized ===");
             Log($"CacheDir: {CacheDir}");
             Log($"FFmpeg: {FindFfmpeg()}");
+            MarkOrphanedCachesForResume();
             CleanOldDirs();
+        }
+
+        /// <summary>
+        /// Beim Startup: Cache-Dirs ohne ENDLIST und ohne idle_stopped Marker
+        /// stammen von FFmpeg-Prozessen die beim letzten Shutdown noch liefen.
+        /// → idle_stopped Marker schreiben damit Resume beim nächsten Playback greift.
+        /// </summary>
+        private static void MarkOrphanedCachesForResume()
+        {
+            try
+            {
+                int marked = 0;
+                foreach (var dir in Directory.GetDirectories(CacheDir))
+                {
+                    var m3u8 = Path.Combine(dir, "stream.m3u8");
+                    var idleMarker = Path.Combine(dir, "idle_stopped");
+                    var playbackFile = Path.Combine(dir, "playback.m3u8");
+
+                    if (!File.Exists(m3u8)) continue;
+                    if (File.Exists(idleMarker)) continue; // schon markiert
+
+                    try
+                    {
+                        var content = File.ReadAllText(m3u8);
+                        if (content.Contains("#EXT-X-ENDLIST")) continue; // komplett gemuxt
+
+                        int segs = CountSegments(content);
+                        if (segs < MinSegmentsForCache) continue; // zu wenig zum Resumen
+
+                        File.WriteAllText(idleMarker, $"{DateTime.UtcNow:O}\n{segs}");
+                        UpdatePlaybackM3u8(m3u8, playbackFile);
+
+                        Log($"MarkOrphanedCaches: {Path.GetFileName(dir)} marked for resume ({segs} segs)");
+                        marked++;
+                    }
+                    catch { }
+                }
+                if (marked > 0)
+                    Log($"MarkOrphanedCaches: Marked {marked} cache(s) for resume");
+            }
+            catch (Exception ex)
+            {
+                Log($"MarkOrphanedCaches error: {ex.Message}");
+            }
         }
 
         private static void Log(string msg)
@@ -728,6 +808,8 @@ namespace Emby.InvidiousPlugin
                     {
                         int lastSegCount = 0;
                         DateTime lastNewSegTime = DateTime.UtcNow;
+                        DateTime lastSessionSeen = DateTime.UtcNow;
+                        int tickCounter = 0;
 
                         while (RunningProcesses.ContainsKey(processKey))
                         {
@@ -745,10 +827,19 @@ namespace Emby.InvidiousPlugin
                                     lastNewSegTime = DateTime.UtcNow;
                                 }
 
-                                // ── Stall-Detection (60s keine neuen Segmente) ──
-                                if ((DateTime.UtcNow - lastNewSegTime).TotalMilliseconds >= IdleTimeoutMs)
+                                // ── Session-Check alle ~2s ──
+                                tickCounter++;
+                                if ((tickCounter % (SessionCheckMs / PlaybackUpdateIntervalMs)) == 0)
                                 {
-                                    // FFmpeg schreibt keine neuen Segmente mehr
+                                    if (IsVideoBeingPlayed(videoId))
+                                        lastSessionSeen = DateTime.UtcNow;
+                                }
+
+                                bool noSession = (DateTime.UtcNow - lastSessionSeen).TotalMilliseconds >= SessionGraceMs;
+                                bool ffmpegStalled = (DateTime.UtcNow - lastNewSegTime).TotalMilliseconds >= IdleTimeoutMs;
+
+                                if (noSession || ffmpegStalled)
+                                {
                                     bool processStillRunning = false;
                                     if (RunningProcesses.TryGetValue(processKey, out var checkProc))
                                     {
@@ -759,18 +850,18 @@ namespace Emby.InvidiousPlugin
                                     if (!processStillRunning)
                                         break;
 
-                                    Log($"IDLE: No new segments for {IdleTimeoutMs / 1000}s ({currentSegs} segs), equalizing {processKey}");
+                                    string reason = noSession ? "no session" : "FFmpeg stalled";
+                                    Log($"STOP: {reason} ({currentSegs} segs), equalizing {processKey}");
 
                                     await EqualizeBeforeStop(videoId, processKey).ConfigureAwait(false);
-
-                                    Log($"IDLE: Equalization done for {videoId}");
+                                    Log($"STOP: Equalization done for {videoId}");
                                     StopAndMarkIdle(processKey);
                                     break;
                                 }
                             }
                             catch (Exception ex)
                             {
-                                Log($"Idle-check error for {processKey}: {ex.Message}");
+                                Log($"Watchdog error for {processKey}: {ex.Message}");
                             }
 
                             await Task.Delay(PlaybackUpdateIntervalMs).ConfigureAwait(false);

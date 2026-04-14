@@ -21,7 +21,7 @@ namespace Emby.InvidiousPlugin
         public string Name => "Invidious";
         public string Description => "Privacy-friendly YouTube via your Invidious instance.";
         public string Id => "invidious_channel_20";
-        public string DataVersion => "9.0.0";
+        public string DataVersion => "10.0.0";
         public ChannelParentalRating ParentalRating => ChannelParentalRating.GeneralAudience;
         public bool IsEnabledByDefault => true;
 
@@ -576,10 +576,6 @@ namespace Emby.InvidiousPlugin
 
         private static string BestVideoThumbnail(JsonElement el, string videoId)
         {
-            // Immer YouTube-CDN verwenden — Invidious-URLs brauchen Auth
-            // und sind bei neuen Videos oft noch nicht verfügbar.
-            var ytCdn = $"https://i.ytimg.com/vi/{videoId}/mqdefault.jpg";
-
             if (el.TryGetProperty("videoThumbnails", out var thumbArr)
                 && thumbArr.ValueKind == JsonValueKind.Array)
             {
@@ -602,8 +598,10 @@ namespace Emby.InvidiousPlugin
                 if (!string.IsNullOrEmpty(bestUrl)) return bestUrl!;
             }
 
-            return ytCdn;
+            // Fallback: hqdefault existiert für praktisch alle Videos
+            return $"https://i.ytimg.com/vi/{videoId}/hqdefault.jpg";
         }
+
 
         // ────────────────────────────────────────────────────────────
         //  Media Playback — HLS Stottern behoben
@@ -701,9 +699,12 @@ namespace Emby.InvidiousPlugin
                 int maxMuxedHeight = muxedStreams.Count > 0
                     ? muxedStreams.Max(m => m.height) : 0;
 
-                string audioMuxUrl = !string.IsNullOrEmpty(bestAudio.url)
-                    ? bestAudio.url!
-                    : $"{baseUrl}/latest_version?id={videoId}&itag={bestAudio.itag}&local=true";
+                // Auth-freie URL für FFmpeg + Auth-Header separat
+                var cleanBase = InvidiousApi.GetCleanBaseUrl(baseUrl);
+                var authHeaders = InvidiousApi.BuildPlaybackHeaders(baseUrl);
+                string? ffmpegAuth = authHeaders.TryGetValue("Authorization", out var ah) ? ah : null;
+
+                string audioMuxUrl = $"{cleanBase}/latest_version?id={videoId}&itag={bestAudio.itag}&local=true";
 
                 var hlsQualities =
                     new List<(string itag, string? url, int height, string label, bool isVp9)>();
@@ -712,13 +713,27 @@ namespace Emby.InvidiousPlugin
 
                 if (canMux && (bestVideo.height >= 1080 || bestVideo.height > maxMuxedHeight))
                 {
-                    hlsQualities.Add((bestVideo.itag!, bestVideo.url, bestVideo.height,
-                        bestVideo.label ?? $"{bestVideo.height}p", bestVideo.isVp9));
+                    bool allow4K = config.Enable4K && bestVideo.height > 1080;
+
+                    if (allow4K)
+                    {
+                        hlsQualities.Add((bestVideo.itag!, bestVideo.url, bestVideo.height,
+                            bestVideo.label ?? $"{bestVideo.height}p", bestVideo.isVp9));
+                    }
 
                     if (bestVideo.height > 1080 && bestVideo.fallback1080Itag != null)
+                    {
+                        // 1080p Fallback — immer hinzufügen
                         hlsQualities.Add((bestVideo.fallback1080Itag!, bestVideo.fallback1080Url,
                             1080, bestVideo.fallback1080Label ?? "1080p",
                             bestVideo.fallback1080IsVp9));
+                    }
+                    else if (bestVideo.height == 1080)
+                    {
+                        // Video ist nativ 1080p
+                        hlsQualities.Add((bestVideo.itag!, bestVideo.url, bestVideo.height,
+                            bestVideo.label ?? $"{bestVideo.height}p", bestVideo.isVp9));
+                    }
                 }
 
                 foreach (var q in hlsQualities.OrderByDescending(x => x.height))
@@ -727,9 +742,7 @@ namespace Emby.InvidiousPlugin
                     string videoCodec = q.isVp9 ? "vp9" : "h264";
                     int w = HeightToWidth(q.height);
 
-                    string videoMuxUrl = !string.IsNullOrEmpty(q.url)
-                        ? q.url!
-                        : $"{baseUrl}/latest_version?id={videoId}&itag={q.itag}&local=true";
+                    string videoMuxUrl = $"{cleanBase}/latest_version?id={videoId}&itag={q.itag}&local=true";
 
                     if (cachedStream != null)
                     {
@@ -740,9 +753,13 @@ namespace Emby.InvidiousPlugin
                     {
                         var playbackPath = MuxHelper.PreparePlaybackPath(videoId, q.height);
 
+                        // Bei Resume: ENDLIST aus playback.m3u8 entfernen damit Emby
+                        // die Datei als wachsenden Stream behandelt
+                        MuxHelper.PrepareForResume(videoId, q.height);
+
                         _ = Task.Run(() => MuxHelper.MuxToHlsAsync(
                             videoMuxUrl, audioMuxUrl,
-                            videoId, q.height, q.isVp9));
+                            videoId, q.height, q.isVp9, ffmpegAuth));
 
                         // Kurz warten (max 2s) bis mindestens 1 Segment da ist
                         // → sofortiges Abspielen möglich, aber kein langes Blockieren
@@ -953,15 +970,16 @@ namespace Emby.InvidiousPlugin
         }
 
         // ────────────────────────────────────────────────────────────
-        //  Kurzer Wait: max 5s, pollt alle 250ms ob mindestens
+        //  Kurzer Wait: max 12s, pollt alle 300ms ob mindestens
         //  3 Segmente in playback.m3u8 stehen → stabiler Start.
-        //  Gibt immer zurück — blockiert nie länger als 5s.
+        //  Segmente à 4s → Seg1 ~4s, Seg2 ~8s, Seg3 ~12s.
+        //  Gibt immer zurück — blockiert nie länger als 12s.
         // ────────────────────────────────────────────────────────────
         private static async Task QuickWaitForFirstSegment(
             string playbackPath, CancellationToken ct)
         {
-            const int maxMs = 5000;
-            const int pollMs = 250;
+            const int maxMs = 12000;
+            const int pollMs = 300;
             const int minSegments = 3;
             int waited = 0;
 
@@ -992,6 +1010,7 @@ namespace Emby.InvidiousPlugin
             }
             // Timeout → trotzdem zurückkehren, Emby bekommt die Source
         }
+
 
         private static MediaSourceInfo BuildReelSource(
             string videoId, string itag, string label,

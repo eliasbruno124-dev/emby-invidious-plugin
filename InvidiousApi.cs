@@ -341,6 +341,17 @@ namespace Emby.InvidiousPlugin
                 && !url.Contains("yt3.ggpht.com", StringComparison.Ordinal))
                 url = "https://yt3.ggpht.com" + url.Substring(ggphtIdx + 6);
 
+            // /vi_webp/VIDEOID/thumb.webp → /vi/VIDEOID/thumb.jpg
+            var viWebpIdx = url.IndexOf("/vi_webp/", StringComparison.Ordinal);
+            if (viWebpIdx >= 0
+                && !url.Contains("i.ytimg.com", StringComparison.Ordinal))
+            {
+                url = "https://i.ytimg.com/vi/" + url.Substring(viWebpIdx + 9);
+                // .webp → .jpg für maximale Kompatibilität
+                if (url.EndsWith(".webp", StringComparison.OrdinalIgnoreCase))
+                    url = url.Substring(0, url.Length - 5) + ".jpg";
+            }
+
             var viIdx = url.IndexOf("/vi/", StringComparison.Ordinal);
             if (viIdx >= 0
                 && !url.Contains("i.ytimg.com", StringComparison.Ordinal)
