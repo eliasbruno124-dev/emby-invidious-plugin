@@ -17,6 +17,9 @@ namespace Emby.InvidiousPlugin
 
         private static readonly ConcurrentDictionary<string, Process> RunningProcesses = new();
 
+        // Koordination: Nur EIN Watchdog pro Video darf Stop+Equalization durchführen
+        private static readonly ConcurrentDictionary<string, bool> StopInProgress = new();
+
         private const int SessionCheckMs = 2000;   // alle 2s Session prüfen
         private const int SessionGraceMs = 30_000;  // 30s ohne Session → Stop
 
@@ -418,17 +421,21 @@ namespace Emby.InvidiousPlugin
                 Log($"Equalize: {key} has {segs}/{maxSegs} segs — waiting until caught up");
 
             const int pollMs = 1000;
+            const int maxWaitIterations = 3600; // 1 Stunde max
             var pendingKeys = new HashSet<string>(behind.Select(b => b.key));
+            int waitIteration = 0;
 
-            while (pendingKeys.Count > 0)
+            while (pendingKeys.Count > 0 && waitIteration < maxWaitIterations)
             {
                 await Task.Delay(pollMs).ConfigureAwait(false);
+                waitIteration++;
 
                 foreach (var key in pendingKeys.ToList())
                 {
                     if (!RunningProcesses.TryGetValue(key, out var proc))
                     {
                         // Prozess schon beendet (fertig oder Fehler)
+                        Log($"Equalize: {key} process ended during catch-up");
                         pendingKeys.Remove(key);
                         continue;
                     }
@@ -452,6 +459,15 @@ namespace Emby.InvidiousPlugin
                         StopAndMarkIdle(key);
                         pendingKeys.Remove(key);
                     }
+                }
+            }
+
+            if (waitIteration >= maxWaitIterations)
+            {
+                Log($"Equalize: Timeout after 1 hour, stopping remaining qualities");
+                foreach (var key in pendingKeys)
+                {
+                    StopAndMarkIdle(key);
                 }
             }
 
@@ -537,7 +553,11 @@ namespace Emby.InvidiousPlugin
                         ct.ThrowIfCancellationRequested();
                         await Task.Delay(PollIntervalMs, ct).ConfigureAwait(false);
 
-                        if (!RunningProcesses.ContainsKey(processKey)) break;
+                        if (!RunningProcesses.ContainsKey(processKey)) 
+                        {
+                            Log($"Running process for {processKey} completed");
+                            break;
+                        }
 
                         if (File.Exists(playback))
                         {
@@ -557,12 +577,21 @@ namespace Emby.InvidiousPlugin
                             }
                         }
                     }
+                    // Nach Wartezeit: Prozess ist fertig, überprüfe ob Daten da sind
                     if (File.Exists(playback))
                     {
-                        var fc = File.ReadAllText(playback);
-                        if (CountSegments(fc) >= 1) return playback;
+                        try
+                        {
+                            var fc = File.ReadAllText(playback);
+                            if (CountSegments(fc) >= 1) 
+                            {
+                                Log($"Process completed, returning {CountSegments(fc)} segments");
+                                return playback;
+                            }
+                        }
+                        catch { }
                     }
-                    Log("Wait timeout for running process");
+                    Log("Wait timeout for running process, no playback available");
                     return null;
                 }
 
@@ -583,6 +612,7 @@ namespace Emby.InvidiousPlugin
                     finally { try { oldProc.Dispose(); } catch { } }
                 }
 
+                bool resumeAttempted = false;
                 if (File.Exists(m3u8))
                 {
                     var age = DateTime.UtcNow - File.GetLastWriteTimeUtc(m3u8);
@@ -604,6 +634,7 @@ namespace Emby.InvidiousPlugin
                         if (File.Exists(idleMarker) && CountSegments(cached) >= MinSegmentsForCache)
                         {
                             Log($"RESUME: Found partial cache ({CountSegments(cached)} segs) for {processKey}");
+                            resumeAttempted = true;
                             // Nicht löschen — weiter unten wird mit -ss fortgesetzt
                         }
                         else
@@ -647,37 +678,57 @@ namespace Emby.InvidiousPlugin
                     string seekArg = "";
                     var idleMarkerPath = Path.Combine(videoDir, "idle_stopped");
 
-                    if (File.Exists(idleMarkerPath) && File.Exists(m3u8))
+                    if (File.Exists(idleMarkerPath) && File.Exists(m3u8) && resumeAttempted)
                     {
-                        var existingContent = File.ReadAllText(m3u8);
-                        int existingSegs = CountSegments(existingContent);
-                        double existingDuration = ParseTotalDuration(existingContent);
-
-                        if (existingSegs >= MinSegmentsForCache && existingDuration > 0)
+                        try
                         {
-                            startNumber = existingSegs;
-                            // 2s Overlap für sauberen Übergang
-                            double seekSec = Math.Max(0, existingDuration - 2);
-                            seekArg = $"-ss {seekSec:F2} ";
-                            Log($"RESUME: Starting at seg {startNumber}, seeking to {seekSec:F1}s (total cached: {existingDuration:F1}s)");
+                            var existingContent = File.ReadAllText(m3u8);
+                            int existingSegs = CountSegments(existingContent);
+                            double existingDuration = ParseTotalDuration(existingContent);
 
-                            // Idle-Marker löschen
-                            try { File.Delete(idleMarkerPath); } catch { }
-
-                            // #EXT-X-ENDLIST aus stream.m3u8 entfernen falls vorhanden
-                            // und #EXT-X-DISCONTINUITY einfügen → signalisiert Emby
-                            // dass sich Timestamps/Codecs ändern können (kein Stottern)
-                            if (existingContent.Contains("#EXT-X-ENDLIST"))
+                            if (existingSegs >= MinSegmentsForCache && existingDuration > 0)
                             {
-                                existingContent = existingContent.Replace("#EXT-X-ENDLIST", "").TrimEnd();
+                                startNumber = existingSegs;
+                                // 2s Overlap für sauberen Übergang
+                                double seekSec = Math.Max(0, existingDuration - 2);
+                                seekArg = $"-ss {seekSec:F2} ";
+                                Log($"RESUME: Starting at seg {startNumber}, seeking to {seekSec:F1}s (total cached: {existingDuration:F1}s)");
+
+                                // Idle-Marker löschen
+                                try { File.Delete(idleMarkerPath); } catch { }
+
+                                // #EXT-X-ENDLIST aus stream.m3u8 entfernen falls vorhanden
+                                // und #EXT-X-DISCONTINUITY einfügen → signalisiert Emby
+                                // dass sich Timestamps/Codecs ändern können (kein Stottern)
+                                if (existingContent.Contains("#EXT-X-ENDLIST"))
+                                {
+                                    existingContent = existingContent.Replace("#EXT-X-ENDLIST", "").TrimEnd();
+                                }
+                                existingContent += "\n#EXT-X-DISCONTINUITY\n";
+                                File.WriteAllText(m3u8, existingContent);
                             }
-                            existingContent += "\n#EXT-X-DISCONTINUITY\n";
-                            File.WriteAllText(m3u8, existingContent);
+                            else
+                            {
+                                Log($"Resume: insufficient data (segs={existingSegs}, duration={existingDuration}), starting fresh");
+                                try { File.Delete(idleMarkerPath); } catch { }
+                                try { Directory.Delete(videoDir, true); } catch { }
+                                Directory.CreateDirectory(videoDir);
+                            }
                         }
-                        else
+                        catch (Exception ex)
                         {
+                            Log($"Resume detection error: {ex.Message}, starting fresh");
                             try { File.Delete(idleMarkerPath); } catch { }
+                            try { Directory.Delete(videoDir, true); } catch { }
+                            Directory.CreateDirectory(videoDir);
                         }
+                    }
+                    else if (!File.Exists(idleMarkerPath) && resumeAttempted)
+                    {
+                        // Marker fehlt aber resumeAttempted ist true - cleanup nötig
+                        Log($"Resume marker missing, re-muxing from scratch");
+                        try { Directory.Delete(videoDir, true); } catch { }
+                        Directory.CreateDirectory(videoDir);
                     }
 
                     var segPattern = Path.Combine(videoDir, $"seg_%04d.{segExt}");
@@ -850,12 +901,38 @@ namespace Emby.InvidiousPlugin
                                     if (!processStillRunning)
                                         break;
 
-                                    string reason = noSession ? "no session" : "FFmpeg stalled";
-                                    Log($"STOP: {reason} ({currentSegs} segs), equalizing {processKey}");
+                                    // Nur EIN Watchdog pro Video darf stoppen
+                                    if (!StopInProgress.TryAdd(videoId, true))
+                                    {
+                                        // Anderer Watchdog stoppt bereits → warten bis er fertig ist
+                                        Log($"STOP: Another watchdog already stopping {videoId}, waiting...");
+                                        while (StopInProgress.ContainsKey(videoId))
+                                            await Task.Delay(500).ConfigureAwait(false);
+                                        break;
+                                    }
 
-                                    await EqualizeBeforeStop(videoId, processKey).ConfigureAwait(false);
-                                    Log($"STOP: Equalization done for {videoId}");
-                                    StopAndMarkIdle(processKey);
+                                    try
+                                    {
+                                        string reason = noSession ? "no session" : "FFmpeg stalled";
+                                        Log($"STOP: {reason} ({currentSegs} segs), equalizing {processKey}");
+
+                                        await EqualizeBeforeStop(videoId, processKey).ConfigureAwait(false);
+                                        Log($"STOP: Equalization done for {videoId}");
+
+                                        // ALLE Qualitäten dieses Videos stoppen (inkl. triggernde)
+                                        var allKeys = RunningProcesses.Keys
+                                            .Where(k => k.StartsWith(videoId + "_", StringComparison.Ordinal))
+                                            .ToList();
+                                        foreach (var key in allKeys)
+                                            StopAndMarkIdle(key);
+
+                                        // Triggernde Qualität selbst stoppen falls noch da
+                                        StopAndMarkIdle(processKey);
+                                    }
+                                    finally
+                                    {
+                                        StopInProgress.TryRemove(videoId, out _);
+                                    }
                                     break;
                                 }
                             }
