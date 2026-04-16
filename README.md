@@ -12,7 +12,6 @@ Plugin Screenshot
 
 <img width="1532" height="353" alt="4k" src="https://github.com/user-attachments/assets/b8f1e9e5-0084-4031-8103-6eaf99adf926" />
 
-
 ## ✨ Features
 
 ### Core
@@ -66,7 +65,7 @@ Plugin Screenshot
 
 ## ⚙️ Configuration
 
-Settings Screenshot 
+Settings Screenshot
 
 <img width="635" height="847" alt="settings" src="https://github.com/user-attachments/assets/e6d2159c-cccc-470f-aa9d-db0d142ceceb" />
 
@@ -110,7 +109,7 @@ Go to your Emby Dashboard and open the "Invidious" plugin settings.
 
 |Setting|Default|Range|Description|
 |-|-|-|-|
-|**HLS Cache Duration (Days)**|3|0–30|How long to keep muxed HLS segments on disk. Set to 0 to always re-mux.|
+|**HLS Cache Duration (Days)**|3|0–30|How long to keep muxed HLS segments on disk. Set to 0 to delete all caches.|
 
 \---
 
@@ -145,4 +144,3 @@ To fetch new videos from your saved channels and playlists, Emby uses an automat
 ## 📄 License
 
 This project is open-source and free to use, modify, and distribute.
-

@@ -92,7 +92,7 @@ namespace Emby.InvidiousPlugin
         [DisplayName("HLS Cache Duration (Days)")]
         [Description(
             "How many days to keep muxed HLS segments on disk (used for 1080p and 4K streams).\n" +
-            "Set to 0 to disable caching — each playback will re-mux from scratch.\n" +
+            "Set to 0 to delete all caches and always re-mux from scratch.\n" +
             "Recommended: 3 days. Higher values save bandwidth but use more disk space.")]
         [Range(0, 30)]
         public int CacheDays { get; set; } = 3;

@@ -18,19 +18,19 @@ namespace Emby.InvidiousPlugin
 
         private static readonly ConcurrentDictionary<string, Process> RunningProcesses = new();
 
-        // Koordination: Nur EIN Watchdog pro Video darf Stop+Equalization durchführen
+        // Coordination: only one watchdog per video may perform stop + equalization
         private static readonly ConcurrentDictionary<string, bool> StopInProgress = new();
 
-        // Verhindert doppelten Resume-Start durch den Session-Monitor
+        // Prevents duplicate resume starts from the session monitor
         private static readonly ConcurrentDictionary<string, bool> ResumeInProgress = new();
 
         private static readonly object LogLock = new();
         private static CancellationTokenSource? _monitorCts;
 
-        private const int SessionCheckMs = 2000;   // alle 2s Session prüfen
+        private const int SessionCheckMs = 2000;   // check session every 2s
 
         /// <summary>
-        /// Prüft ob irgendeine Emby-Session gerade dieses Video abspielt.
+        /// Checks whether any Emby session is currently playing this video.
         /// </summary>
         private static bool IsVideoBeingPlayed(string videoId)
         {
@@ -83,7 +83,7 @@ namespace Emby.InvidiousPlugin
 
         private static int GetIdleTimeoutMs(bool isVp9 = false)
         {
-            // VP9/4K braucht viel länger zum Seekieren und Demuxen
+            // VP9/4K needs much longer for seeking and demuxing
             int baseTimeout;
             try { var p = Plugin.Instance; if (p != null) baseTimeout = Math.Clamp(p.Options.IdleTimeoutSeconds, 15, 300) * 1000; else baseTimeout = 30_000; } catch { baseTimeout = 30_000; }
             return isVp9 ? Math.Max(baseTimeout, 120_000) : baseTimeout;
@@ -97,8 +97,8 @@ namespace Emby.InvidiousPlugin
         }
 
         /// <summary>
-        /// Startup-Logik. Wird im static ctor aufgerufen und kann bei Plugin-Reload
-        /// über EnsureInitialized() erneut aufgerufen werden.
+        /// Startup logic. Called from the static constructor and can be invoked
+        /// again via EnsureInitialized() on plugin reload.
         /// </summary>
         private static void Initialize()
         {
@@ -106,18 +106,18 @@ namespace Emby.InvidiousPlugin
             Log($"CacheDir: {CacheDir}");
             Log($"FFmpeg: {FindFfmpeg()}");
 
-            // Statische Dictionaries leeren (nötig bei Plugin-Reload im selben AppDomain)
+            // Clear static dictionaries (needed on plugin reload within the same AppDomain)
             RunningProcesses.Clear();
             StopInProgress.Clear();
             ResumeInProgress.Clear();
 
-            // Verwaiste FFmpeg-Prozesse killen die noch vom letzten Emby-Lauf stammen
+            // Kill orphaned FFmpeg processes left over from the previous Emby run
             KillOrphanedFfmpegProcesses();
 
             MarkOrphanedCachesForResume();
             CleanOldDirs();
 
-            // Alten Monitor stoppen falls noch aktiv (Plugin-Reload)
+            // Stop the old monitor if still active (plugin reload)
             try { _monitorCts?.Cancel(); } catch { }
             try { _monitorCts?.Dispose(); } catch { }
             _monitorCts = new CancellationTokenSource();
@@ -125,8 +125,8 @@ namespace Emby.InvidiousPlugin
         }
 
         /// <summary>
-        /// Kann von außen aufgerufen werden um den MuxHelper neu zu initialisieren
-        /// (z.B. nach Plugin-Reload). Ist thread-safe und idempotent.
+        /// Can be called externally to re-initialize MuxHelper
+        /// (e.g. after plugin reload). Thread-safe and idempotent.
         /// </summary>
         private static bool _initialized;
         private static readonly object InitLock = new();
@@ -137,14 +137,14 @@ namespace Emby.InvidiousPlugin
             {
                 if (_initialized) return;
                 _initialized = true;
-                // Static ctor hat schon Initialize() aufgerufen.
-                // Falls Plugin-Reload: Re-Initialize.
+                // Static ctor already called Initialize().
+                // On plugin reload: re-initialize.
             }
         }
 
         /// <summary>
-        /// Killt alle FFmpeg-Prozesse die unser Cache-Verzeichnis verwenden.
-        /// Nötig weil auf Windows Child-Prozesse den Parent-Kill überleben.
+        /// Kills all FFmpeg processes that use our cache directory.
+        /// Needed because on Windows, child processes survive parent termination.
         /// </summary>
         private static void KillOrphanedFfmpegProcesses()
         {
@@ -156,8 +156,8 @@ namespace Emby.InvidiousPlugin
                 {
                     try
                     {
-                        // Kill alle ffmpeg-Prozesse die VOR dem aktuellen
-                        // Emby-Start gestartet wurden (= Überbleibsel vom letzten Lauf).
+                        // Kill all ffmpeg processes that started BEFORE the current
+                        // Emby process (= leftovers from the last run).
                         try
                         {
                             if (proc.StartTime < Process.GetCurrentProcess().StartTime)
@@ -183,9 +183,9 @@ namespace Emby.InvidiousPlugin
         }
 
         /// <summary>
-        /// Beim Startup: Cache-Dirs ohne ENDLIST und ohne idle_stopped Marker
-        /// stammen von FFmpeg-Prozessen die beim letzten Shutdown noch liefen.
-        /// → idle_stopped Marker schreiben damit Resume beim nächsten Playback greift.
+        /// On startup: cache dirs without ENDLIST and without idle_stopped marker
+        /// belong to FFmpeg processes that were still running during the last shutdown.
+        /// Write idle_stopped marker so resume works on next playback.
         /// </summary>
         private static void MarkOrphanedCachesForResume()
         {
@@ -202,18 +202,18 @@ namespace Emby.InvidiousPlugin
                     var metaFile = Path.Combine(dir, "_resume_meta.txt");
 
                     if (!File.Exists(m3u8)) continue;
-                    if (File.Exists(idleMarker)) continue; // schon markiert
+                    if (File.Exists(idleMarker)) continue; // already marked
 
                     try
                     {
                         var content = SafeReadAllText(m3u8);
                         if (content == null) continue;
-                        if (content.Contains("#EXT-X-ENDLIST")) continue; // komplett gemuxt
+                        if (content.Contains("#EXT-X-ENDLIST")) continue; // fully muxed
 
                         int segs = CountSegments(content);
-                        if (segs < MinSegmentsForResume) continue; // zu wenig zum Resumen
+                        if (segs < MinSegmentsForResume) continue; // too few segments to resume
 
-                        // Nur markieren wenn auch Resume-Metadaten vorhanden sind
+                        // Only mark if resume metadata is available
                         if (!File.Exists(metaFile))
                         {
                             Log($"MarkOrphanedCaches: {Path.GetFileName(dir)} has no _resume_meta.txt, skipping");
@@ -309,21 +309,21 @@ namespace Emby.InvidiousPlugin
         {
             Log("=== MuxHelper shutting down ===");
 
-            // Monitor stoppen
+            // Stop the monitor
             try { _monitorCts?.Cancel(); } catch { }
 
-            // Alle FFmpeg-Prozesse killen
+            // Kill all FFmpeg processes
             KillAll();
 
-            // CTS aufräumen
+            // Clean up CTS
             try { _monitorCts?.Dispose(); _monitorCts = null; } catch { }
 
-            // Statische Dictionaries leeren damit bei Plugin-Reload
-            // keine Geister-Einträge bleiben
+            // Clear static dictionaries so no ghost entries remain
+            // on plugin reload
             StopInProgress.Clear();
             ResumeInProgress.Clear();
 
-            // Für alle Cache-Dirs die kein ENDLIST haben: idle_stopped schreiben
+            // Write idle_stopped for all cache dirs without ENDLIST
             MarkOrphanedCachesForResume();
 
             Log("=== MuxHelper shutdown complete ===");
@@ -337,6 +337,15 @@ namespace Emby.InvidiousPlugin
                 catch (IOException) when (i < 2) { Thread.Sleep(50 * (i + 1)); }
             }
             return null;
+        }
+
+        private static void SafeWriteAllText(string path, string content)
+        {
+            for (int i = 0; i < 3; i++)
+            {
+                try { File.WriteAllText(path, content); return; }
+                catch (IOException) when (i < 2) { Thread.Sleep(100 * (i + 1)); }
+            }
         }
 
         private static string? ExtractQueryParam(string url, string param)
@@ -369,8 +378,8 @@ namespace Emby.InvidiousPlugin
                     return null;
                 }
 
-                // Partieller Cache (idle-gestoppt) → null zurückgeben
-                // damit MuxToHlsAsync die Resume-Logik ausführt
+                // Partial cache (idle-stopped) → return null
+                // so MuxToHlsAsync runs the resume logic
                 if (File.Exists(idleMarker))
                 {
                     Log($"GetCachedStreamPath: {videoId}_{height}p — idle_stopped marker found → returning null for resume");
@@ -417,8 +426,8 @@ namespace Emby.InvidiousPlugin
         }
 
         /// <summary>
-        /// Bereitet playback.m3u8 für Resume vor: entfernt ENDLIST damit
-        /// Emby die Datei als wachsenden Stream behandelt.
+        /// Prepares playback.m3u8 for resume: removes ENDLIST so that
+        /// Emby treats the file as a growing stream.
         /// </summary>
         public static void PrepareForResume(string videoId, int height)
         {
@@ -480,7 +489,8 @@ namespace Emby.InvidiousPlugin
             try
             {
                 if (!File.Exists(sourcePath)) return;
-                var content = File.ReadAllText(sourcePath);
+                var content = SafeReadAllText(sourcePath);
+                if (content == null) return;
 
                 if (!content.Contains("#EXT-X-ENDLIST"))
                     content += "\n#EXT-X-ENDLIST\n";
@@ -501,16 +511,17 @@ namespace Emby.InvidiousPlugin
         }
 
         // ────────────────────────────────────────────────────────────
-        //  Dauer-basierte Equalization: Die schnellere Qualität wird sofort
-        //  gestoppt. Die langsamere muxt alleine weiter bis sie die gleiche
-        //  DAUER (nicht Segment-Anzahl!) erreicht hat, dann wird sie auch gestoppt.
-        //  → VP9 und H264 haben unterschiedliche Segment-Längen (3-4s vs 5.5s)
-        //    → Segment-Count-Vergleich führt zu ungleicher Content-Dauer.
+        //  Duration-based equalization: the faster quality is stopped
+        //  immediately. The slower one continues muxing alone until it
+        //  reaches the same DURATION (not segment count!), then it is
+        //  also stopped.
+        //  → VP9 and H264 have different segment lengths (3-4s vs 5.5s)
+        //    → Segment-count comparison leads to unequal content duration.
         // ────────────────────────────────────────────────────────────
         private static async Task EqualizeBeforeStop(string videoId, string triggeringKey)
         {
-            // Alle laufenden Prozesse für dieses Video finden
-            // SafeReadAllText verhindert Race-Conditions mit FFmpeg's m3u8.tmp-Rename
+            // Find all running processes for this video
+            // SafeReadAllText prevents race conditions with FFmpeg's m3u8.tmp rename
             var siblings = new List<(string key, double dur, int segs)>();
             foreach (var kvp in RunningProcesses)
             {
@@ -537,17 +548,17 @@ namespace Emby.InvidiousPlugin
             }
 
             double maxDur = siblings.Max(s => s.dur);
-            // Triggernde Qualität NICHT sofort stoppen — ihr Watchdog läuft noch
-            // und muss die Equalization zu Ende führen
+            // Don't stop the triggering quality immediately — its watchdog is still
+            // running and must complete the equalization
             var ahead = siblings
                 .Where(s => s.dur >= maxDur && s.key != triggeringKey)
                 .ToList();
-            // Triggernde Qualität MIT einbeziehen falls sie hinterher ist
+            // Include the triggering quality if it is behind
             var behind = siblings
                 .Where(s => s.dur < maxDur)
                 .ToList();
 
-            // ── Schnellere Qualität(en) sofort stoppen ──
+            // ── Stop faster quality/qualities immediately ──
             foreach (var (key, dur, segs) in ahead)
             {
                 Log($"Equalize: Stopping faster quality {key} ({dur:F1}s, {segs} segs)");
@@ -560,13 +571,21 @@ namespace Emby.InvidiousPlugin
                 return;
             }
 
-            // ── Langsamere Qualität(en) weiter muxen lassen bis sie aufgeholt haben ──
+            // ── Let slower quality/qualities keep muxing until they catch up ──
             foreach (var (key, dur, segs) in behind)
                 Log($"Equalize: {key} has {dur:F1}s/{maxDur:F1}s ({segs} segs) — waiting until caught up");
 
             const int pollMs = 2000;
-            const int maxWaitMs = 300_000; // 5 Minuten max
+            const int maxWaitMs = 300_000; // 5 minutes max
             var pendingKeys = new HashSet<string>(behind.Select(b => b.key));
+            // Stall detection: track last known duration and when it last changed
+            var lastDur = new Dictionary<string, double>();
+            var lastDurChange = new Dictionary<string, DateTime>();
+            foreach (var (key, dur, _) in behind)
+            {
+                lastDur[key] = dur;
+                lastDurChange[key] = DateTime.UtcNow;
+            }
             int elapsed = 0;
 
             while (pendingKeys.Count > 0 && elapsed < maxWaitMs)
@@ -578,12 +597,25 @@ namespace Emby.InvidiousPlugin
                 {
                     if (!RunningProcesses.TryGetValue(key, out var proc))
                     {
-                        Log($"Equalize: {key} process ended during catch-up");
+                        Log($"Equalize: {key} process ended during catch-up (removed from RunningProcesses)");
                         pendingKeys.Remove(key);
                         continue;
                     }
-                    try { if (proc.HasExited) { pendingKeys.Remove(key); continue; } }
-                    catch { pendingKeys.Remove(key); continue; }
+                    try
+                    {
+                        if (proc.HasExited)
+                        {
+                            Log($"Equalize: {key} FFmpeg exited during catch-up (exit={proc.ExitCode})");
+                            pendingKeys.Remove(key);
+                            continue;
+                        }
+                    }
+                    catch
+                    {
+                        Log($"Equalize: {key} process state unknown (exception), removing");
+                        pendingKeys.Remove(key);
+                        continue;
+                    }
 
                     var dir = Path.Combine(CacheDir, key);
                     var m3u8 = Path.Combine(dir, "stream.m3u8");
@@ -608,6 +640,26 @@ namespace Emby.InvidiousPlugin
                             StopAndMarkIdle(key);
                         }
                         pendingKeys.Remove(key);
+                        continue;
+                    }
+
+                    // Stall detection: if duration hasn't grown, check for stall timeout
+                    if (currentDur > lastDur.GetValueOrDefault(key, 0))
+                    {
+                        lastDur[key] = currentDur;
+                        lastDurChange[key] = DateTime.UtcNow;
+                    }
+                    else
+                    {
+                        bool isVp9 = key.Contains("2160p") || key.Contains("1440p");
+                        int stallTimeoutMs = GetIdleTimeoutMs(isVp9);
+                        double stalledFor = (DateTime.UtcNow - lastDurChange.GetValueOrDefault(key, DateTime.UtcNow)).TotalMilliseconds;
+                        if (stalledFor >= stallTimeoutMs)
+                        {
+                            Log($"Equalize: {key} STALLED at {currentDur:F1}s/{maxDur:F1}s ({currentSegs} segs) — no progress for {stalledFor / 1000:F0}s, force-stopping");
+                            StopAndMarkIdle(key);
+                            pendingKeys.Remove(key);
+                        }
                     }
                 }
             }
@@ -625,7 +677,8 @@ namespace Emby.InvidiousPlugin
         }
 
         /// <summary>
-        /// Stoppt einen einzelnen FFmpeg-Prozess und schreibt den idle_stopped Marker.
+        /// Stops a single FFmpeg process and writes the idle_stopped marker.
+        /// Waits for process exit to avoid file-lock conflicts with stream.m3u8.
         /// </summary>
         private static void StopAndMarkIdle(string processKey)
         {
@@ -635,29 +688,42 @@ namespace Emby.InvidiousPlugin
             try { if (!proc.HasExited) proc.Kill(); }
             catch { }
 
+            // Wait for the process to fully exit and release file handles
+            try { proc.WaitForExit(3000); }
+            catch { }
+
+            var dir = Path.Combine(CacheDir, processKey);
+            var idleMarker = Path.Combine(dir, "idle_stopped");
+
             try
             {
-                var dir = Path.Combine(CacheDir, processKey);
                 var m3u8 = Path.Combine(dir, "stream.m3u8");
                 var playbackPath = Path.Combine(dir, "playback.m3u8");
-                var idleMarker = Path.Combine(dir, "idle_stopped");
 
                 int segs = 0;
-                if (File.Exists(m3u8))
-                    segs = CountSegments(File.ReadAllText(m3u8));
+                var content = SafeReadAllText(m3u8);
+                if (content != null)
+                    segs = CountSegments(content);
 
-                File.WriteAllText(idleMarker, $"{DateTime.UtcNow:O}\n{segs}");
+                // Write idle marker with retry to handle residual file locks
+                SafeWriteAllText(idleMarker, $"{DateTime.UtcNow:O}\n{segs}");
 
                 UpdatePlaybackM3u8(m3u8, playbackPath);
-                // KEIN ENDLIST hinzufügen — der Player soll weiter pollen,
-                // damit der Session-Monitor bei erneutem Abspielen
-                // FFmpeg fortsetzen kann und neue Segmente erscheinen.
 
                 Log($"StopAndMarkIdle: {processKey} stopped ({segs} segs)");
             }
             catch (Exception ex)
             {
                 Log($"StopAndMarkIdle error for {processKey}: {ex.Message}");
+
+                // Last resort: write idle marker even if everything else failed,
+                // so the session monitor can still resume this cache later
+                try
+                {
+                    SafeWriteAllText(idleMarker, $"{DateTime.UtcNow:O}\n0");
+                    Log($"StopAndMarkIdle: {processKey} — wrote idle marker despite error");
+                }
+                catch { }
             }
 
             try { proc.Dispose(); } catch { }
@@ -709,9 +775,9 @@ namespace Emby.InvidiousPlugin
         }
 
         // ────────────────────────────────────────────────────────────
-        //  Session-Resume-Monitor: Prüft periodisch ob eine Session
-        //  ein Video abspielt, das einen idle_stopped Cache hat.
-        //  Falls ja → FFmpeg-Resume starten.
+        //  Session-Resume-Monitor: periodically checks whether a session
+        //  is playing a video that has an idle_stopped cache.
+        //  If so → start FFmpeg resume.
         // ────────────────────────────────────────────────────────────
         private static void StartSessionResumeMonitor(CancellationToken ct)
         {
@@ -764,15 +830,15 @@ namespace Emby.InvidiousPlugin
                     if (lastUnderscore < 0) continue;
                     var videoId = dirName.Substring(0, lastUnderscore);
 
-                    // Läuft bereits ein Prozess für dieses Video?
+                    // Already running a process for this video?
                     if (RunningProcesses.ContainsKey(dirName)) continue;
-                    // Wird bereits resumed?
+                    // Already being resumed?
                     if (ResumeInProgress.ContainsKey(dirName)) continue;
 
-                    // Wird dieses Video gerade abgespielt?
+                    // Is this video currently being played?
                     if (!IsVideoBeingPlayed(videoId)) continue;
 
-                    // Resume-Metadaten lesen
+                    // Read resume metadata
                     var metaFile = Path.Combine(dir, "_resume_meta.txt");
                     if (!File.Exists(metaFile)) continue;
 
@@ -797,7 +863,7 @@ namespace Emby.InvidiousPlugin
                             continue;
                         }
 
-                        // URLs aus aktueller Config rekonstruieren (robust gegen URL-Änderungen)
+                        // Reconstruct URLs from current config (robust against URL changes)
                         string? authHeader = null;
                         string videoUrl, audioUrl;
                         try
@@ -836,10 +902,10 @@ namespace Emby.InvidiousPlugin
 
                         Log($"SessionResumeMonitor: Resuming {dirName} (session active)");
 
-                        // ENDLIST aus playback.m3u8 entfernen
+                        // Remove ENDLIST from playback.m3u8
                         PrepareForResume(videoId, height);
 
-                        // FFmpeg-Resume im Hintergrund starten
+                        // Start FFmpeg resume in background
                         var capturedVideoUrl = videoUrl;
                         var capturedAudioUrl = audioUrl;
                         var capturedHeight = height;
@@ -926,7 +992,7 @@ namespace Emby.InvidiousPlugin
                             }
                         }
                     }
-                    // Nach Wartezeit: Prozess ist fertig, überprüfe ob Daten da sind
+                    // After wait timeout: process finished, check if data is available
                     if (File.Exists(playback))
                     {
                         try
@@ -969,7 +1035,7 @@ namespace Emby.InvidiousPlugin
                     {
                         var cached = File.ReadAllText(m3u8);
 
-                        // Vollständiger Cache → sofort zurückgeben
+                        // Complete cache → return immediately
                         if (cached.Contains("#EXT-X-ENDLIST")
                             && CountSegments(cached) >= MinSegmentsForCache)
                         {
@@ -978,13 +1044,13 @@ namespace Emby.InvidiousPlugin
                             return File.Exists(playback) ? playback : m3u8;
                         }
 
-                        // Partieller Cache (idle-gestoppt) → Resume vorbereiten
+                        // Partial cache (idle-stopped) → prepare for resume
                         var idleMarker = Path.Combine(videoDir, "idle_stopped");
                         if (File.Exists(idleMarker) && CountSegments(cached) >= MinSegmentsForResume)
                         {
                             Log($"RESUME: Found partial cache ({CountSegments(cached)} segs) for {processKey}");
                             resumeAttempted = true;
-                            // Nicht löschen — weiter unten wird mit -ss fortgesetzt
+                            // Don't delete — will be resumed below with -ss
                         }
                         else
                         {
@@ -1014,7 +1080,7 @@ namespace Emby.InvidiousPlugin
 
                     string segExt = isVp9 ? "m4s" : "ts";
 
-                    // ── Resume-Erkennung ──
+                    // ── Resume detection ──
                     bool isResume = false;
                     string seekArg = "";
                     var idleMarkerPath = Path.Combine(videoDir, "idle_stopped");
@@ -1030,19 +1096,19 @@ namespace Emby.InvidiousPlugin
                             if (existingSegs >= MinSegmentsForResume)
                             {
                                 isResume = true;
-                                // Exakt an der letzten Position fortsetzen (kein Overlap)
-                                // FFmpeg input-seek springt zum nächsten Keyframe davor,
-                                // append_list setzt die Timeline nahtlos fort.
+                                // Resume at the exact last position (no overlap).
+                                // FFmpeg input-seek jumps to the nearest keyframe before,
+                                // append_list continues the timeline seamlessly.
                                 double seekSec = existingDuration;
                                 seekArg = $"-ss {seekSec.ToString("F2", CultureInfo.InvariantCulture)} ";
                                 Log($"RESUME: {existingSegs} segs cached ({existingDuration.ToString("F1", CultureInfo.InvariantCulture)}s), seeking to {seekSec.ToString("F1", CultureInfo.InvariantCulture)}s");
 
-                                // Idle-Marker löschen
+                                // Delete idle marker
                                 try { File.Delete(idleMarkerPath); } catch { }
 
-                                // #EXT-X-ENDLIST entfernen damit Emby weiter pollt.
-                                // KEIN DISCONTINUITY einfügen — das bricht Emby's Seeking.
-                                // append_list übernimmt Segment-Nummerierung automatisch.
+                                // Remove #EXT-X-ENDLIST so Emby keeps polling.
+                                // Do NOT insert DISCONTINUITY — it breaks Emby's seeking.
+                                // append_list continues segment numbering automatically.
                                 if (existingContent.Contains("#EXT-X-ENDLIST"))
                                 {
                                     existingContent = existingContent.Replace("#EXT-X-ENDLIST", "").TrimEnd();
@@ -1068,7 +1134,7 @@ namespace Emby.InvidiousPlugin
                     }
                     else if (!File.Exists(idleMarkerPath) && resumeAttempted)
                     {
-                        // Marker fehlt aber resumeAttempted ist true - cleanup nötig
+                        // Marker missing but resumeAttempted is true — cleanup needed
                         Log($"Resume marker missing, re-muxing from scratch");
                         try { Directory.Delete(videoDir, true); } catch { }
                         Directory.CreateDirectory(videoDir);
@@ -1080,22 +1146,22 @@ namespace Emby.InvidiousPlugin
                         ? "-c:v copy -c:a copy -hls_segment_type fmp4"
                         : "-c:v copy -c:a copy -bsf:v h264_mp4toannexb";
 
-                    // ── Speed-Optimierungen ──
-                    // -headers: Basic Auth für Invidious-Proxy
-                    // -thread_queue_size 4096: größerer Input-Buffer pro Stream
-                    // -fflags +nobuffer: kein interner Buffering-Delay
-                    // -flags low_delay: minimale Latenz
-                    // -hls_init_time 1: erstes Segment in ~1s fertig
-                    // -hls_time 4: weitere Segmente à 4s
+                    // ── Speed optimizations ──
+                    // -headers: Basic Auth for Invidious proxy
+                    // -thread_queue_size 4096: larger input buffer per stream
+                    // -fflags +nobuffer: no internal buffering delay
+                    // -flags low_delay: minimal latency
+                    // -hls_init_time 1: first segment ready in ~1s
+                    // -hls_time 4: subsequent segments ~4s each
                     string headersArg = !string.IsNullOrEmpty(authHeader)
                         ? $"-headers \"Authorization: {authHeader}\r\n\" "
                         : "";
 
-                    // Bei Resume: kein -avoid_negative_ts make_zero, damit PTS
-                    // aus dem Input-Seek beibehalten werden und die HLS-Timeline
-                    // nahtlos fortgesetzt wird. Auch kein -start_number, da
-                    // append_list die Segment-Nummerierung aus der bestehenden
-                    // m3u8 automatisch fortsetzt.
+                    // On resume: skip -avoid_negative_ts make_zero so PTS
+                    // from input-seek is preserved and the HLS timeline
+                    // continues seamlessly. Also skip -start_number since
+                    // append_list continues segment numbering from the
+                    // existing m3u8 automatically.
                     string avoidNegTs = isResume ? "" : "-avoid_negative_ts make_zero ";
 
                     var args =
@@ -1122,7 +1188,7 @@ namespace Emby.InvidiousPlugin
                         $"-hls_list_size 0 -hls_flags append_list " +
                         $"-hls_segment_filename \"{segPattern}\" \"{m3u8}\"";
 
-                    // Resume-Metadaten speichern (itags für URL-Rekonstruktion)
+                    // Save resume metadata (itags for URL reconstruction)
                     try
                     {
                         var metaFile = Path.Combine(videoDir, "_resume_meta.txt");
@@ -1243,7 +1309,7 @@ namespace Emby.InvidiousPlugin
                                     lastNewSegTime = DateTime.UtcNow;
                                 }
 
-                                // ── Session-Check alle ~2s ──
+                                // ── Session check every ~2s ──
                                 tickCounter++;
                                 if ((tickCounter % (SessionCheckMs / PlaybackUpdateIntervalMs)) == 0)
                                 {
@@ -1253,7 +1319,7 @@ namespace Emby.InvidiousPlugin
 
                                 bool activeSession = (DateTime.UtcNow - lastSessionSeen).TotalMilliseconds < GetSessionGraceMs();
 
-                                // ── Pre-Buffer-Limit: Kein Zuschauer → nach X Segmenten stoppen ──
+                                // ── Pre-buffer limit: no viewer → stop after X segments ──
                                 if (!activeSession && currentSegs >= GetPreBufferSegments())
                                 {
                                     bool processStillRunning = false;
@@ -1310,18 +1376,18 @@ namespace Emby.InvidiousPlugin
                                     if (!processStillRunning)
                                         break;
 
-                                    // Stop/Equalize nur von der höchsten Qualitätsstufe starten,
-                                    // damit höhere Qualitäten nicht vorzeitig separat gestoppt werden.
+                                    // Only start stop/equalize from the highest quality level,
+                                    // so higher qualities are not prematurely stopped separately.
                                     if (!IsHighestQualityForVideo(videoId, processKey))
                                     {
                                         await Task.Delay(1000).ConfigureAwait(false);
                                         continue;
                                     }
 
-                                    // Nur EIN Watchdog pro Video darf stoppen
+                                    // Only one watchdog per video may stop
                                     if (!StopInProgress.TryAdd(videoId, true))
                                     {
-                                        // Anderer Watchdog stoppt bereits → warten bis er fertig ist
+                                        // Another watchdog is already stopping → wait
                                         Log($"STOP: Another watchdog already stopping {videoId}, waiting...");
                                         while (StopInProgress.ContainsKey(videoId))
                                             await Task.Delay(500).ConfigureAwait(false);
@@ -1336,14 +1402,14 @@ namespace Emby.InvidiousPlugin
                                         await EqualizeBeforeStop(videoId, processKey).ConfigureAwait(false);
                                         Log($"STOP: Equalization done for {videoId}");
 
-                                        // ALLE Qualitäten dieses Videos stoppen (inkl. triggernde)
+                                        // Stop ALL qualities for this video (incl. triggering one)
                                         var allKeys = RunningProcesses.Keys
                                             .Where(k => k.StartsWith(videoId + "_", StringComparison.Ordinal))
                                             .ToList();
                                         foreach (var key in allKeys)
                                             StopAndMarkIdle(key);
 
-                                        // Triggernde Qualität selbst stoppen falls noch da
+                                        // Stop the triggering quality itself if still present
                                         StopAndMarkIdle(processKey);
                                     }
                                     finally
@@ -1558,7 +1624,29 @@ namespace Emby.InvidiousPlugin
         {
             try
             {
+                if (!Directory.Exists(CacheDir)) return;
                 int cacheDays = GetCacheDays();
+
+                // CacheDays=0: kill all running processes and delete all caches
+                if (cacheDays <= 0)
+                {
+                    KillAll();
+                    foreach (var dir in Directory.GetDirectories(CacheDir))
+                    {
+                        try
+                        {
+                            Directory.Delete(dir, true);
+                            Log($"CacheDays=0: Deleted cache {Path.GetFileName(dir)}");
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"CleanOldDirs delete error: {ex.Message}");
+                        }
+                    }
+                    Log("CacheDays=0: All caches cleared");
+                    return;
+                }
+
                 foreach (var dir in Directory.GetDirectories(CacheDir))
                 {
                     if ((DateTime.UtcNow - Directory.GetLastWriteTimeUtc(dir)).TotalDays

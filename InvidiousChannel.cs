@@ -40,8 +40,8 @@ namespace Emby.InvidiousPlugin
         private static readonly ConcurrentDictionary<string, VideoMeta> MetaCache = new();
         private static readonly TimeSpan MetaCacheTtl = TimeSpan.FromDays(365);
 
-        // ── RATE LIMITER: verhindert API-Blocking ──
-        // Max 4 gleichzeitige Enrichment-Calls + Mindestabstand 150ms pro Call
+        // ── RATE LIMITER: prevents API blocking ──
+        // Max 4 concurrent enrichment calls + minimum 150ms delay per call
         private static readonly SemaphoreSlim EnrichSemaphore = new(4, 4);
         private const int EnrichDelayMs = 150;
 
@@ -199,8 +199,8 @@ namespace Emby.InvidiousPlugin
 
                         if (doc == null) break;
 
-                        // ── ExtractVideos holt jetzt ALLE verfügbaren Felder
-                        //    direkt aus der Liste (description, published, viewCount) ──
+                        // ── ExtractVideos now fetches ALL available fields
+                        //    directly from the list (description, published, viewCount) ──
                         var tempItems = ExtractVideos(doc);
                         doc.Dispose();
                         lastPageSize = tempItems.Count;
@@ -212,8 +212,8 @@ namespace Emby.InvidiousPlugin
                         {
                             if (skipItems > 0) { skipItems--; continue; }
                             seeking = false;
-                            // Deduplizierung auf Basis der reinen Video-ID
-                            // (ohne LIVE_/REEL_-Prefix)
+                            // Deduplication based on the raw video ID
+                            // (without LIVE_/REEL_ prefix)
                             var rawId = item.Id;
                             if (rawId.StartsWith(LivePrefix, StringComparison.Ordinal))
                                 rawId = rawId.Substring(LivePrefix.Length);
@@ -223,11 +223,11 @@ namespace Emby.InvidiousPlugin
                             if (items.Count + batch.Count >= limit) break;
                         }
 
-                        // ── Cache-Lookup + selektives Enrichment ──
+                        // ── Cache lookup + selective enrichment ──
                         ApplyCachedMeta(batch);
 
-                        // Alle Videos enrichen die noch nicht im Cache sind
-                        // (List-API liefert nur abgeschnittene Beschreibungen)
+                        // Enrich all videos not yet in cache
+                        // (list API only returns truncated descriptions)
                         var uncached = batch
                             .Where(i => !MetaCache.ContainsKey(i.Id))
                             .ToList();
@@ -237,8 +237,8 @@ namespace Emby.InvidiousPlugin
                             await EnrichVideosThrottled(
                                 baseUrl, uncached, cancellationToken).ConfigureAwait(false);
                             EvictExpiredMetaCache();
-                            // Nach Enrichment nochmal Cache anwenden,
-                            // damit die vollen Beschreibungen gesetzt sind
+                            // After enrichment, apply cache again
+                            // so full descriptions are set
                             ApplyCachedMeta(batch);
                         }
 
@@ -277,7 +277,7 @@ namespace Emby.InvidiousPlugin
         }
 
         // ────────────────────────────────────────────────────────────
-        //  NEU: Cached-Meta auf Batch anwenden
+        //  Apply cached meta to batch
         // ────────────────────────────────────────────────────────────
         private static void ApplyCachedMeta(List<ChannelItemInfo> batch)
         {
@@ -285,8 +285,8 @@ namespace Emby.InvidiousPlugin
             {
                 if (!MetaCache.TryGetValue(item.Id, out var cached)) continue;
 
-                // Cached Overview (aus voller Video-API) immer bevorzugen
-                // — die List-API liefert nur abgeschnittene Beschreibungen.
+                // Always prefer cached overview (from full video API)
+                // — the list API only returns truncated descriptions.
                 if (!string.IsNullOrEmpty(cached.Overview))
                     item.Overview = cached.Overview;
 
@@ -303,8 +303,8 @@ namespace Emby.InvidiousPlugin
         }
 
         // ────────────────────────────────────────────────────────────
-        //  NEU: Throttled Enrichment — max 2 gleichzeitig + Delay
-        //  → Verhindert API-Blocking durch Invidious/YouTube
+        //  Throttled enrichment — max 4 concurrent + delay
+        //  → Prevents API blocking by Invidious/YouTube
         // ────────────────────────────────────────────────────────────
         private static async Task EnrichVideosThrottled(
             string baseUrl, List<ChannelItemInfo> uncached, CancellationToken ct)
@@ -315,7 +315,7 @@ namespace Emby.InvidiousPlugin
                 enrichCts.CancelAfter(TimeSpan.FromSeconds(90));
                 var token = enrichCts.Token;
 
-                // Semi-parallel: bis zu 4 gleichzeitig mit kurzem Delay
+                // Semi-parallel: up to 4 concurrent with short delay
                 var tasks = new List<Task>();
                 foreach (var item in uncached)
                 {
@@ -347,7 +347,7 @@ namespace Emby.InvidiousPlugin
         private static async Task EnrichSingleVideo(
             string baseUrl, ChannelItemInfo item, CancellationToken ct)
         {
-            // LIVE_/REEL_-Prefix entfernen für API-Call
+            // Remove LIVE_/REEL_ prefix for API call
             var videoId = item.Id;
             if (videoId.StartsWith(LivePrefix, StringComparison.Ordinal))
                 videoId = videoId.Substring(LivePrefix.Length);
@@ -359,7 +359,7 @@ namespace Emby.InvidiousPlugin
 
             if (vDoc == null)
             {
-                // Negativ-Cache: nicht nochmal versuchen
+                // Negative cache: don't retry
                 MetaCache[item.Id] = new VideoMeta(null, null, null, null, DateTime.UtcNow);
                 return;
             }
@@ -436,7 +436,7 @@ namespace Emby.InvidiousPlugin
             if (allVideos.Count == 0)
                 return Msg(new List<ChannelItemInfo>(), "No results.");
 
-            // ── Enrichment: Beschreibungen für Trending-Videos laden ──
+            // ── Enrichment: load descriptions for trending videos ──
             ApplyCachedMeta(allVideos);
             var uncached = allVideos
                 .Where(i => string.IsNullOrEmpty(i.Overview)
@@ -466,8 +466,8 @@ namespace Emby.InvidiousPlugin
         }
 
         // ────────────────────────────────────────────────────────────
-        //  VERBESSERT: ExtractVideos holt jetzt description + viewCount
-        //  direkt aus den Listendaten → kein Extra-API-Call nötig!
+        //  ExtractVideos now fetches description + viewCount
+        //  directly from the list data → no extra API call needed!
         // ────────────────────────────────────────────────────────────
         private const string LivePrefix = "LIVE_";
         private const string ReelPrefix = "REEL_";
@@ -500,7 +500,7 @@ namespace Emby.InvidiousPlugin
                 var title = InvidiousApi.GetString(el, "title") ?? "Untitled";
                 var author = InvidiousApi.GetString(el, "author") ?? "Unknown";
 
-                // ── Datum direkt aus der Suche/Channelliste ──
+                // ── Date directly from search/channel list ──
                 var pubUnix = InvidiousApi.GetLong(el, "published");
                 DateTime? premiere = pubUnix.HasValue
                     ? DateTimeOffset.FromUnixTimeSeconds(pubUnix.Value).UtcDateTime
@@ -508,7 +508,7 @@ namespace Emby.InvidiousPlugin
 
                 var len = InvidiousApi.GetInt(el, "lengthSeconds");
 
-                // ── Beschreibung direkt aus der Liste holen ──
+                // ── Description directly from the list ──
                 var description = InvidiousApi.GetString(el, "description")
                                ?? InvidiousApi.GetString(el, "descriptionHtml");
                 var viewCount = InvidiousApi.GetLong(el, "viewCount");
@@ -571,9 +571,9 @@ namespace Emby.InvidiousPlugin
                     ImageUrl = thumb
                 };
 
-                // KEIN MetaCache-Write hier — die List-API liefert nur
-                // abgeschnittene Beschreibungen. MetaCache wird erst durch
-                // EnrichSingleVideo (volle Video-API) befüllt.
+                // NO MetaCache write here — the list API only returns
+                // truncated descriptions. MetaCache is only populated by
+                // EnrichSingleVideo (full video API).
 
                 list.Add(info);
             }
@@ -604,13 +604,13 @@ namespace Emby.InvidiousPlugin
                 if (!string.IsNullOrEmpty(bestUrl)) return bestUrl!;
             }
 
-            // Fallback: hqdefault existiert für praktisch alle Videos
+            // Fallback: hqdefault exists for virtually all videos
             return $"https://i.ytimg.com/vi/{videoId}/hqdefault.jpg";
         }
 
 
         // ────────────────────────────────────────────────────────────
-        //  Media Playback — HLS Stottern behoben
+        //  Media Playback — HLS stuttering fixed
         // ────────────────────────────────────────────────────────────
         public async Task<IEnumerable<MediaSourceInfo>> GetChannelItemMediaInfo(
             string id, CancellationToken cancellationToken)
@@ -705,7 +705,7 @@ namespace Emby.InvidiousPlugin
                 int maxMuxedHeight = muxedStreams.Count > 0
                     ? muxedStreams.Max(m => m.height) : 0;
 
-                // Auth-freie URL für FFmpeg + Auth-Header separat
+                // Auth-free URL for FFmpeg + auth header separate
                 var cleanBase = InvidiousApi.GetCleanBaseUrl(baseUrl);
                 var authHeaders = InvidiousApi.BuildPlaybackHeaders(baseUrl);
                 string? ffmpegAuth = authHeaders.TryGetValue("Authorization", out var ah) ? ah : null;
@@ -729,14 +729,14 @@ namespace Emby.InvidiousPlugin
 
                     if (bestVideo.height > 1080 && bestVideo.fallback1080Itag != null)
                     {
-                        // 1080p Fallback — immer hinzufügen
+                        // 1080p fallback — always add
                         hlsQualities.Add((bestVideo.fallback1080Itag!, bestVideo.fallback1080Url,
                             1080, bestVideo.fallback1080Label ?? "1080p",
                             bestVideo.fallback1080IsVp9));
                     }
                     else if (bestVideo.height == 1080)
                     {
-                        // Video ist nativ 1080p
+                        // Video is natively 1080p
                         hlsQualities.Add((bestVideo.itag!, bestVideo.url, bestVideo.height,
                             bestVideo.label ?? $"{bestVideo.height}p", bestVideo.isVp9));
                     }
@@ -759,16 +759,16 @@ namespace Emby.InvidiousPlugin
                     {
                         var playbackPath = MuxHelper.PreparePlaybackPath(videoId, q.height);
 
-                        // Bei Resume: ENDLIST aus playback.m3u8 entfernen damit Emby
-                        // die Datei als wachsenden Stream behandelt
+                        // On resume: remove ENDLIST from playback.m3u8 so Emby
+                        // treats the file as a growing stream
                         MuxHelper.PrepareForResume(videoId, q.height);
 
                         _ = Task.Run(() => MuxHelper.MuxToHlsAsync(
                             videoMuxUrl, audioMuxUrl,
                             videoId, q.height, q.isVp9, ffmpegAuth));
 
-                        // Kurz warten (max 2s) bis mindestens 1 Segment da ist
-                        // → sofortiges Abspielen möglich, aber kein langes Blockieren
+                        // Brief wait (max 2s) until at least 1 segment exists
+                        // → immediate playback possible without long blocking
                         await QuickWaitForFirstSegment(playbackPath, cancellationToken)
                             .ConfigureAwait(false);
 
@@ -976,10 +976,10 @@ namespace Emby.InvidiousPlugin
         }
 
         // ────────────────────────────────────────────────────────────
-        //  Kurzer Wait: max 12s, pollt alle 300ms ob mindestens
-        //  3 Segmente in playback.m3u8 stehen → stabiler Start.
-        //  Segmente à 4s → Seg1 ~4s, Seg2 ~8s, Seg3 ~12s.
-        //  Gibt immer zurück — blockiert nie länger als 12s.
+        //  Quick wait: max 12s, polls every 300ms for at least
+        //  3 segments in playback.m3u8 → stable start.
+        //  Segments ~4s each → Seg1 ~4s, Seg2 ~8s, Seg3 ~12s.
+        //  Always returns — never blocks longer than 12s.
         // ────────────────────────────────────────────────────────────
         private static async Task QuickWaitForFirstSegment(
             string playbackPath, CancellationToken ct)
@@ -1014,7 +1014,7 @@ namespace Emby.InvidiousPlugin
                 }
                 catch { }
             }
-            // Timeout → trotzdem zurückkehren, Emby bekommt die Source
+            // Timeout → return anyway, Emby gets the source
         }
 
 

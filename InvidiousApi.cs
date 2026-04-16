@@ -146,7 +146,7 @@ namespace Emby.InvidiousPlugin
             }
         }
 
-        // ── Alle anderen Methoden bleiben identisch ──
+        // ── All other methods remain unchanged ──
 
         public static async Task<(string? id, string? name, string? thumb)>
             GetChannelDetailsAsync(
@@ -347,7 +347,7 @@ namespace Emby.InvidiousPlugin
                 && !url.Contains("i.ytimg.com", StringComparison.Ordinal))
             {
                 url = "https://i.ytimg.com/vi/" + url.Substring(viWebpIdx + 9);
-                // .webp → .jpg für maximale Kompatibilität
+                // .webp → .jpg for maximum compatibility
                 if (url.EndsWith(".webp", StringComparison.OrdinalIgnoreCase))
                     url = url.Substring(0, url.Length - 5) + ".jpg";
             }
