@@ -395,13 +395,30 @@ namespace Emby.InvidiousPlugin
 
             int maxSegs = siblings.Max(s => s.segs);
             // Triggernde Qualität NICHT sofort stoppen — ihr Watchdog läuft noch
-            // und muss die Equalization zu Ende führen
+            // und muss die Equalization zu Ende führen.
+            // AUSNAHME: Wenn die triggernde Qualität WENIGER Segmente als maxSegs hat
+            // (z.B. 4K triggert mit 50 Segs, aber 1080p hat bereits 100),
+            // wird sie in die "behind"-Liste aufgenommen und muss aufholen.
+
+            // Segmentanzahl der triggernden Qualität bestimmen.
+            // Falls der Eintrag nicht mehr in siblings ist (Race-Condition), wird
+            // maxSegs als Fallback verwendet → kein unnötiges Catchup.
+            var triggeringEntry = siblings.FirstOrDefault(s => s.key == triggeringKey);
+            int triggeringSegs = triggeringEntry.key != null ? triggeringEntry.segs : maxSegs;
+
             var ahead = siblings
                 .Where(s => s.segs >= maxSegs && s.key != triggeringKey)
                 .ToList();
             var behind = siblings
                 .Where(s => s.segs < maxSegs && s.key != triggeringKey)
                 .ToList();
+
+            // Triggernde Qualität ebenfalls aufholen lassen falls sie hinterherhinkt
+            if (triggeringSegs < maxSegs)
+            {
+                behind.Add((triggeringKey, triggeringSegs));
+                Log($"Equalize: Triggering key {triggeringKey} ({triggeringSegs} segs) is behind maxSegs ({maxSegs}) — included in catchup");
+            }
 
             // ── Schnellere Qualität(en) sofort stoppen ──
             foreach (var (key, segs) in ahead)
@@ -911,29 +928,53 @@ namespace Emby.InvidiousPlugin
                                         break;
                                     }
 
+                                    bool abortStop = false;
                                     try
                                     {
                                         string reason = noSession ? "no session" : "FFmpeg stalled";
-                                        Log($"STOP: {reason} ({currentSegs} segs), equalizing {processKey}");
 
-                                        await EqualizeBeforeStop(videoId, processKey).ConfigureAwait(false);
-                                        Log($"STOP: Equalization done for {videoId}");
+                                        // Letzte Prüfung vor dem Stoppen: Vielleicht hat die Session
+                                        // gerade erst begonnen (Race-Condition vermeiden)
+                                        if (noSession && IsVideoBeingPlayed(videoId))
+                                        {
+                                            Log($"STOP CANCELLED (pre-equalization): {videoId} wird gerade abgespielt");
+                                            lastSessionSeen = DateTime.UtcNow;
+                                            abortStop = true;
+                                        }
+                                        else
+                                        {
+                                            Log($"STOP: {reason} ({currentSegs} segs), equalizing {processKey}");
 
-                                        // ALLE Qualitäten dieses Videos stoppen (inkl. triggernde)
-                                        var allKeys = RunningProcesses.Keys
-                                            .Where(k => k.StartsWith(videoId + "_", StringComparison.Ordinal))
-                                            .ToList();
-                                        foreach (var key in allKeys)
-                                            StopAndMarkIdle(key);
+                                            await EqualizeBeforeStop(videoId, processKey).ConfigureAwait(false);
+                                            Log($"STOP: Equalization done for {videoId}");
 
-                                        // Triggernde Qualität selbst stoppen falls noch da
-                                        StopAndMarkIdle(processKey);
+                                            // Nochmalige Prüfung nach (ggf. langer) Equalization:
+                                            // Wenn die Session inzwischen aktiv ist, Stop abbrechen
+                                            if (IsVideoBeingPlayed(videoId))
+                                            {
+                                                Log($"STOP CANCELLED (post-equalization): {videoId} wird gerade abgespielt");
+                                                lastSessionSeen = DateTime.UtcNow;
+                                                abortStop = true;
+                                            }
+                                            else
+                                            {
+                                                // ALLE Qualitäten dieses Videos stoppen (inkl. triggernde)
+                                                var allKeys = RunningProcesses.Keys
+                                                    .Where(k => k.StartsWith(videoId + "_", StringComparison.Ordinal))
+                                                    .ToList();
+                                                foreach (var key in allKeys)
+                                                    StopAndMarkIdle(key);
+
+                                                // Triggernde Qualität selbst stoppen falls noch da
+                                                StopAndMarkIdle(processKey);
+                                            }
+                                        }
                                     }
                                     finally
                                     {
                                         StopInProgress.TryRemove(videoId, out _);
                                     }
-                                    break;
+                                    if (!abortStop) break;
                                 }
                             }
                             catch (Exception ex)
