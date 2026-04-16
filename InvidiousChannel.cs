@@ -1,6 +1,5 @@
 using MediaBrowser.Controller.Channels;
 using MediaBrowser.Controller.Providers;
-using MediaBrowser.Model.Channels;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Drawing;
 using MediaBrowser.Model.Entities;
@@ -21,7 +20,7 @@ namespace Emby.InvidiousPlugin
         public string Name => "Invidious";
         public string Description => "Privacy-friendly YouTube via your Invidious instance.";
         public string Id => "invidious_channel_20";
-        public string DataVersion => "10.0.0";
+        public string DataVersion => "11.0.0";
         public ChannelParentalRating ParentalRating => ChannelParentalRating.GeneralAudience;
         public bool IsEnabledByDefault => true;
 
@@ -227,10 +226,10 @@ namespace Emby.InvidiousPlugin
                         // ── Cache-Lookup + selektives Enrichment ──
                         ApplyCachedMeta(batch);
 
-                        // Nur Videos ohne Beschreibung UND ohne Cache enrichen
+                        // Alle Videos enrichen die noch nicht im Cache sind
+                        // (List-API liefert nur abgeschnittene Beschreibungen)
                         var uncached = batch
-                            .Where(i => string.IsNullOrEmpty(i.Overview)
-                                        && !MetaCache.ContainsKey(i.Id))
+                            .Where(i => !MetaCache.ContainsKey(i.Id))
                             .ToList();
 
                         if (uncached.Count > 0)
@@ -238,6 +237,9 @@ namespace Emby.InvidiousPlugin
                             await EnrichVideosThrottled(
                                 baseUrl, uncached, cancellationToken).ConfigureAwait(false);
                             EvictExpiredMetaCache();
+                            // Nach Enrichment nochmal Cache anwenden,
+                            // damit die vollen Beschreibungen gesetzt sind
+                            ApplyCachedMeta(batch);
                         }
 
                         foreach (var item in batch)
@@ -283,7 +285,9 @@ namespace Emby.InvidiousPlugin
             {
                 if (!MetaCache.TryGetValue(item.Id, out var cached)) continue;
 
-                if (!string.IsNullOrEmpty(cached.Overview) && string.IsNullOrEmpty(item.Overview))
+                // Cached Overview (aus voller Video-API) immer bevorzugen
+                // — die List-API liefert nur abgeschnittene Beschreibungen.
+                if (!string.IsNullOrEmpty(cached.Overview))
                     item.Overview = cached.Overview;
 
                 if (cached.Premiere.HasValue && !item.PremiereDate.HasValue)
@@ -308,7 +312,7 @@ namespace Emby.InvidiousPlugin
             try
             {
                 using var enrichCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                enrichCts.CancelAfter(TimeSpan.FromSeconds(30));
+                enrichCts.CancelAfter(TimeSpan.FromSeconds(90));
                 var token = enrichCts.Token;
 
                 // Semi-parallel: bis zu 4 gleichzeitig mit kurzem Delay
@@ -343,8 +347,15 @@ namespace Emby.InvidiousPlugin
         private static async Task EnrichSingleVideo(
             string baseUrl, ChannelItemInfo item, CancellationToken ct)
         {
+            // LIVE_/REEL_-Prefix entfernen für API-Call
+            var videoId = item.Id;
+            if (videoId.StartsWith(LivePrefix, StringComparison.Ordinal))
+                videoId = videoId.Substring(LivePrefix.Length);
+            else if (videoId.StartsWith(ReelPrefix, StringComparison.Ordinal))
+                videoId = videoId.Substring(ReelPrefix.Length);
+
             using var vDoc = await InvidiousApi.TryGetVideoAsync(
-                baseUrl, item.Id, ct).ConfigureAwait(false);
+                baseUrl, videoId, ct).ConfigureAwait(false);
 
             if (vDoc == null)
             {
@@ -553,21 +564,16 @@ namespace Emby.InvidiousPlugin
                     RunTimeTicks = isLive
                         ? null
                         : (len > 0 ? TimeSpan.FromSeconds(len.Value).Ticks : null),
-                    ContentType = ChannelMediaContentType.Episode,
+                    ContentType = MediaBrowser.Model.Channels.ChannelMediaContentType.Episode,
                     Id = itemId,
                     Type = ChannelItemType.Media,
-                    MediaType = ChannelMediaType.Video,
+                    MediaType = MediaBrowser.Model.Channels.ChannelMediaType.Video,
                     ImageUrl = thumb
                 };
 
-                // ── Sofort in Cache schreiben wenn wir Daten haben ──
-                if (overview != null || premiere.HasValue || len > 0)
-                {
-                    MetaCache[itemId] = new VideoMeta(
-                        overview, premiere, premiere?.Year,
-                        len > 0 ? TimeSpan.FromSeconds(len.Value).Ticks : null,
-                        DateTime.UtcNow);
-                }
+                // KEIN MetaCache-Write hier — die List-API liefert nur
+                // abgeschnittene Beschreibungen. MetaCache wird erst durch
+                // EnrichSingleVideo (volle Video-API) befüllt.
 
                 list.Add(info);
             }

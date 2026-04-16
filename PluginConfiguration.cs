@@ -48,7 +48,7 @@ namespace Emby.InvidiousPlugin
             "ISO 3166-1 country code for YouTube trending results.\n" +
             "Examples: DE (Germany), US (USA), AT (Austria), CH (Switzerland), GB (UK), FR (France).\n" +
             "Leave empty for Invidious default.")]
-        public string TrendingRegion { get; set; } = "DE";
+        public string TrendingRegion { get; set; } = "";
 
         // ─────────────────────────────────────────────────────────────────────
         // SORTING
@@ -83,15 +83,7 @@ namespace Emby.InvidiousPlugin
             "Enable 4K video quality. When disabled, the maximum HLS quality is 1080p.\n" +
             "Disable this on hardware-weak systems to save CPU and bandwidth,\n" +
             "as 4K VP9 muxing is significantly more demanding.")]
-        public bool Enable4K { get; set; } = true;
-
-        [DisplayName("Max Concurrent Muxes")]
-        [Description(
-            "Maximum number of FFmpeg mux processes running at the same time.\n" +
-            "Lower values save CPU/RAM, higher values allow more parallel streams.\n" +
-            "Set to 0 for unlimited. Recommended: 4.")]
-        [Range(0, 64)]
-        public int MaxConcurrentMuxes { get; set; } = 4;
+        public bool Enable4K { get; set; } = false;
 
         // ─────────────────────────────────────────────────────────────────────
         // CACHING
@@ -104,5 +96,42 @@ namespace Emby.InvidiousPlugin
             "Recommended: 3 days. Higher values save bandwidth but use more disk space.")]
         [Range(0, 30)]
         public int CacheDays { get; set; } = 3;
+
+        // ─────────────────────────────────────────────────────────────────────
+        // ADVANCED / PERFORMANCE
+        // ─────────────────────────────────────────────────────────────────────
+
+        [DisplayName("FFmpeg Path")]
+        [Description(
+            "Custom path to the FFmpeg executable.\n" +
+            "Leave empty to auto-detect (searches PATH and common install locations).\n" +
+            "Examples:\n" +
+            "  • C:\\ffmpeg\\bin\\ffmpeg.exe\n" +
+            "  • /usr/bin/ffmpeg")]
+        public string FfmpegPath { get; set; } = "";
+
+        [DisplayName("Pre-Buffer Segments")]
+        [Description(
+            "Max HLS segments to pre-buffer when no one is actively watching.\n" +
+            "Each segment ≈ 4 seconds. Default: 90 (~6 min buffer).\n" +
+            "Lower = less disk/bandwidth, higher = less re-buffering.\n" +
+            "Range: 10–300.")]
+        [Range(10, 300)]
+        public int PreBufferSegments { get; set; } = 90;
+
+        [DisplayName("Session Grace Period (Seconds)")]
+        [Description(
+            "Seconds to keep muxing after the last viewer stops watching.\n" +
+            "Prevents unnecessary stop+resume cycles during brief pauses.\n" +
+            "Default: 15. Range: 5–120.")]
+        [Range(5, 120)]
+        public int SessionGraceSeconds { get; set; } = 15;
+
+        [DisplayName("Idle Timeout (Seconds)")]
+        [Description(
+            "Stop FFmpeg if no new segment is produced within this time (stall detection).\n" +
+            "Default: 30. Range: 15–300.")]
+        [Range(15, 300)]
+        public int IdleTimeoutSeconds { get; set; } = 30;
     }
 }

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -20,8 +21,13 @@ namespace Emby.InvidiousPlugin
         // Koordination: Nur EIN Watchdog pro Video darf Stop+Equalization durchführen
         private static readonly ConcurrentDictionary<string, bool> StopInProgress = new();
 
+        // Verhindert doppelten Resume-Start durch den Session-Monitor
+        private static readonly ConcurrentDictionary<string, bool> ResumeInProgress = new();
+
+        private static readonly object LogLock = new();
+        private static CancellationTokenSource? _monitorCts;
+
         private const int SessionCheckMs = 2000;   // alle 2s Session prüfen
-        private const int SessionGraceMs = 30_000;  // 30s ohne Session → Stop
 
         /// <summary>
         /// Prüft ob irgendeine Emby-Session gerade dieses Video abspielt.
@@ -55,53 +61,125 @@ namespace Emby.InvidiousPlugin
             return false;
         }
 
-        // Dynamisch konfigurierbar — 0 = unlimited
-        private static SemaphoreSlim MuxGate = new(4, 4);
-        private static int _currentMuxLimit = 4;
-        private static readonly object MuxGateLock = new();
+        private const int MinSegmentsForPlayback = 3;
+        private const int MinSegmentsForCache = 6;
+        private const int MinSegmentsForResume = 1;
+        private const int SegmentWaitMaxIterations = 300;
+        private const int RunningProcessWaitMaxIterations = 120;
+        private const int PollIntervalMs = 400;
+        private const int PlaybackUpdateIntervalMs = 800;
 
-        private static SemaphoreSlim GetMuxGate()
+        private static int GetPreBufferSegments()
         {
-            int configured;
-            try
-            {
-                var plugin = Plugin.Instance;
-                configured = plugin != null ? plugin.Options.MaxConcurrentMuxes : 4;
-            }
-            catch { configured = 4; }
-
-            // 0 = unlimited → wir setzen auf 64 als praktisches Maximum
-            if (configured <= 0) configured = 64;
-
-            lock (MuxGateLock)
-            {
-                if (configured != _currentMuxLimit)
-                {
-                    Log($"MuxGate limit changed: {_currentMuxLimit} → {configured}");
-                    MuxGate = new SemaphoreSlim(configured, configured);
-                    _currentMuxLimit = configured;
-                }
-                return MuxGate;
-            }
+            try { var p = Plugin.Instance; if (p != null) return Math.Clamp(p.Options.PreBufferSegments, 10, 300); } catch { }
+            return 90;
         }
 
-        private const int MinSegmentsForPlayback = 4;   // war 2 → mehr Buffer
-        private const int MinSegmentsForCache = 6;
-        private const int SegmentWaitMaxIterations = 300; // war 240 → mehr Geduld
-        private const int RunningProcessWaitMaxIterations = 120;
-        private const int PollIntervalMs = 400;           // war 500 → schnellere Reaktion
-        private const int PlaybackUpdateIntervalMs = 800;  // war 1000 → häufigere Updates
-        private const int IdleTimeoutMs = 60_000;          // 60s ohne Segment-Zugriff → FFmpeg stoppen
+        private static int GetSessionGraceMs()
+        {
+            try { var p = Plugin.Instance; if (p != null) return Math.Clamp(p.Options.SessionGraceSeconds, 5, 120) * 1000; } catch { }
+            return 15_000;
+        }
+
+        private static int GetIdleTimeoutMs(bool isVp9 = false)
+        {
+            // VP9/4K braucht viel länger zum Seekieren und Demuxen
+            int baseTimeout;
+            try { var p = Plugin.Instance; if (p != null) baseTimeout = Math.Clamp(p.Options.IdleTimeoutSeconds, 15, 300) * 1000; else baseTimeout = 30_000; } catch { baseTimeout = 30_000; }
+            return isVp9 ? Math.Max(baseTimeout, 120_000) : baseTimeout;
+        }
 
         static MuxHelper()
         {
             CacheDir = FindWritableDir();
             LogPath = Path.Combine(CacheDir, "_debug.log");
+            Initialize();
+        }
+
+        /// <summary>
+        /// Startup-Logik. Wird im static ctor aufgerufen und kann bei Plugin-Reload
+        /// über EnsureInitialized() erneut aufgerufen werden.
+        /// </summary>
+        private static void Initialize()
+        {
             Log("=== MuxHelper initialized ===");
             Log($"CacheDir: {CacheDir}");
             Log($"FFmpeg: {FindFfmpeg()}");
+
+            // Statische Dictionaries leeren (nötig bei Plugin-Reload im selben AppDomain)
+            RunningProcesses.Clear();
+            StopInProgress.Clear();
+            ResumeInProgress.Clear();
+
+            // Verwaiste FFmpeg-Prozesse killen die noch vom letzten Emby-Lauf stammen
+            KillOrphanedFfmpegProcesses();
+
             MarkOrphanedCachesForResume();
             CleanOldDirs();
+
+            // Alten Monitor stoppen falls noch aktiv (Plugin-Reload)
+            try { _monitorCts?.Cancel(); } catch { }
+            try { _monitorCts?.Dispose(); } catch { }
+            _monitorCts = new CancellationTokenSource();
+            StartSessionResumeMonitor(_monitorCts.Token);
+        }
+
+        /// <summary>
+        /// Kann von außen aufgerufen werden um den MuxHelper neu zu initialisieren
+        /// (z.B. nach Plugin-Reload). Ist thread-safe und idempotent.
+        /// </summary>
+        private static bool _initialized;
+        private static readonly object InitLock = new();
+        public static void EnsureInitialized()
+        {
+            if (_initialized) return;
+            lock (InitLock)
+            {
+                if (_initialized) return;
+                _initialized = true;
+                // Static ctor hat schon Initialize() aufgerufen.
+                // Falls Plugin-Reload: Re-Initialize.
+            }
+        }
+
+        /// <summary>
+        /// Killt alle FFmpeg-Prozesse die unser Cache-Verzeichnis verwenden.
+        /// Nötig weil auf Windows Child-Prozesse den Parent-Kill überleben.
+        /// </summary>
+        private static void KillOrphanedFfmpegProcesses()
+        {
+            try
+            {
+                int killed = 0;
+
+                foreach (var proc in Process.GetProcessesByName("ffmpeg"))
+                {
+                    try
+                    {
+                        // Kill alle ffmpeg-Prozesse die VOR dem aktuellen
+                        // Emby-Start gestartet wurden (= Überbleibsel vom letzten Lauf).
+                        try
+                        {
+                            if (proc.StartTime < Process.GetCurrentProcess().StartTime)
+                            {
+                                proc.Kill();
+                                killed++;
+                                Log($"KillOrphanedFfmpeg: Killed PID {proc.Id} (started {proc.StartTime:HH:mm:ss})");
+                            }
+                        }
+                        catch { }
+                    }
+                    catch { }
+                    finally { try { proc.Dispose(); } catch { } }
+                }
+
+                if (killed > 0)
+                    Log($"KillOrphanedFfmpeg: Killed {killed} orphaned FFmpeg process(es)");
+            }
+            catch (Exception ex)
+            {
+                Log($"KillOrphanedFfmpeg error: {ex.Message}");
+            }
         }
 
         /// <summary>
@@ -113,23 +191,34 @@ namespace Emby.InvidiousPlugin
         {
             try
             {
+                if (!Directory.Exists(CacheDir)) return;
+
                 int marked = 0;
                 foreach (var dir in Directory.GetDirectories(CacheDir))
                 {
                     var m3u8 = Path.Combine(dir, "stream.m3u8");
                     var idleMarker = Path.Combine(dir, "idle_stopped");
                     var playbackFile = Path.Combine(dir, "playback.m3u8");
+                    var metaFile = Path.Combine(dir, "_resume_meta.txt");
 
                     if (!File.Exists(m3u8)) continue;
                     if (File.Exists(idleMarker)) continue; // schon markiert
 
                     try
                     {
-                        var content = File.ReadAllText(m3u8);
+                        var content = SafeReadAllText(m3u8);
+                        if (content == null) continue;
                         if (content.Contains("#EXT-X-ENDLIST")) continue; // komplett gemuxt
 
                         int segs = CountSegments(content);
-                        if (segs < MinSegmentsForCache) continue; // zu wenig zum Resumen
+                        if (segs < MinSegmentsForResume) continue; // zu wenig zum Resumen
+
+                        // Nur markieren wenn auch Resume-Metadaten vorhanden sind
+                        if (!File.Exists(metaFile))
+                        {
+                            Log($"MarkOrphanedCaches: {Path.GetFileName(dir)} has no _resume_meta.txt, skipping");
+                            continue;
+                        }
 
                         File.WriteAllText(idleMarker, $"{DateTime.UtcNow:O}\n{segs}");
                         UpdatePlaybackM3u8(m3u8, playbackFile);
@@ -152,17 +241,20 @@ namespace Emby.InvidiousPlugin
         {
             try
             {
-                if (File.Exists(LogPath) && new FileInfo(LogPath).Length > MaxLogBytes)
+                lock (LogLock)
                 {
-                    var oldLog = LogPath + ".old";
-                    try { File.Move(LogPath, oldLog, overwrite: true); }
-                    catch (Exception ex)
+                    if (File.Exists(LogPath) && new FileInfo(LogPath).Length > MaxLogBytes)
                     {
-                        Debug.WriteLine($"[MuxHelper] Log rotation failed: {ex.Message}");
+                        var oldLog = LogPath + ".old";
+                        try { File.Move(LogPath, oldLog, overwrite: true); }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"[MuxHelper] Log rotation failed: {ex.Message}");
+                        }
                     }
+                    File.AppendAllText(LogPath,
+                        $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} [T{Environment.CurrentManagedThreadId}] {msg}\r\n");
                 }
-                File.AppendAllText(LogPath,
-                    $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} [T{Environment.CurrentManagedThreadId}] {msg}\r\n");
             }
             catch (Exception ex)
             {
@@ -202,12 +294,59 @@ namespace Emby.InvidiousPlugin
             {
                 if (RunningProcesses.TryRemove(key, out var proc))
                 {
-                    try { if (!proc.HasExited) proc.Kill(); }
-                    catch (Exception ex) { Log($"KillAll failed for {key}: {ex.Message}"); }
+                    try
+                    {
+                        if (!proc.HasExited) proc.Kill();
+                    }
+                    catch { }
                     finally { try { proc.Dispose(); } catch { } }
                 }
             }
             Log("Killed all FFmpeg processes");
+        }
+
+        public static void Shutdown()
+        {
+            Log("=== MuxHelper shutting down ===");
+
+            // Monitor stoppen
+            try { _monitorCts?.Cancel(); } catch { }
+
+            // Alle FFmpeg-Prozesse killen
+            KillAll();
+
+            // CTS aufräumen
+            try { _monitorCts?.Dispose(); _monitorCts = null; } catch { }
+
+            // Statische Dictionaries leeren damit bei Plugin-Reload
+            // keine Geister-Einträge bleiben
+            StopInProgress.Clear();
+            ResumeInProgress.Clear();
+
+            // Für alle Cache-Dirs die kein ENDLIST haben: idle_stopped schreiben
+            MarkOrphanedCachesForResume();
+
+            Log("=== MuxHelper shutdown complete ===");
+        }
+
+        private static string? SafeReadAllText(string path)
+        {
+            for (int i = 0; i < 3; i++)
+            {
+                try { return File.ReadAllText(path); }
+                catch (IOException) when (i < 2) { Thread.Sleep(50 * (i + 1)); }
+            }
+            return null;
+        }
+
+        private static string? ExtractQueryParam(string url, string param)
+        {
+            var key = param + "=";
+            var idx = url.IndexOf(key, StringComparison.OrdinalIgnoreCase);
+            if (idx < 0) return null;
+            var start = idx + key.Length;
+            var end = url.IndexOf('&', start);
+            return end > 0 ? url.Substring(start, end - start) : url.Substring(start);
         }
 
         public static string? GetCachedStreamPath(string videoId, int height)
@@ -362,14 +501,17 @@ namespace Emby.InvidiousPlugin
         }
 
         // ────────────────────────────────────────────────────────────
-        //  Segment-Equalization: Die schnellere Qualität wird sofort
-        //  gestoppt. Die langsamere muxt alleine weiter bis sie den
-        //  gleichen Segment-Stand erreicht hat, dann wird sie auch gestoppt.
+        //  Dauer-basierte Equalization: Die schnellere Qualität wird sofort
+        //  gestoppt. Die langsamere muxt alleine weiter bis sie die gleiche
+        //  DAUER (nicht Segment-Anzahl!) erreicht hat, dann wird sie auch gestoppt.
+        //  → VP9 und H264 haben unterschiedliche Segment-Längen (3-4s vs 5.5s)
+        //    → Segment-Count-Vergleich führt zu ungleicher Content-Dauer.
         // ────────────────────────────────────────────────────────────
         private static async Task EqualizeBeforeStop(string videoId, string triggeringKey)
         {
             // Alle laufenden Prozesse für dieses Video finden
-            var siblings = new List<(string key, int segs)>();
+            // SafeReadAllText verhindert Race-Conditions mit FFmpeg's m3u8.tmp-Rename
+            var siblings = new List<(string key, double dur, int segs)>();
             foreach (var kvp in RunningProcesses)
             {
                 if (!kvp.Key.StartsWith(videoId + "_", StringComparison.Ordinal))
@@ -377,14 +519,15 @@ namespace Emby.InvidiousPlugin
 
                 var dir = Path.Combine(CacheDir, kvp.Key);
                 var m3u8 = Path.Combine(dir, "stream.m3u8");
+                double dur = 0;
                 int segs = 0;
-                try
+                var content = SafeReadAllText(m3u8);
+                if (content != null)
                 {
-                    if (File.Exists(m3u8))
-                        segs = CountSegments(File.ReadAllText(m3u8));
+                    dur = ParseTotalDuration(content);
+                    segs = CountSegments(content);
                 }
-                catch { }
-                siblings.Add((kvp.Key, segs));
+                siblings.Add((kvp.Key, dur, segs));
             }
 
             if (siblings.Count < 2)
@@ -393,48 +536,48 @@ namespace Emby.InvidiousPlugin
                 return;
             }
 
-            int maxSegs = siblings.Max(s => s.segs);
+            double maxDur = siblings.Max(s => s.dur);
             // Triggernde Qualität NICHT sofort stoppen — ihr Watchdog läuft noch
             // und muss die Equalization zu Ende führen
             var ahead = siblings
-                .Where(s => s.segs >= maxSegs && s.key != triggeringKey)
+                .Where(s => s.dur >= maxDur && s.key != triggeringKey)
                 .ToList();
+            // Triggernde Qualität MIT einbeziehen falls sie hinterher ist
             var behind = siblings
-                .Where(s => s.segs < maxSegs && s.key != triggeringKey)
+                .Where(s => s.dur < maxDur)
                 .ToList();
 
             // ── Schnellere Qualität(en) sofort stoppen ──
-            foreach (var (key, segs) in ahead)
+            foreach (var (key, dur, segs) in ahead)
             {
-                Log($"Equalize: Stopping faster quality {key} ({segs} segs)");
+                Log($"Equalize: Stopping faster quality {key} ({dur:F1}s, {segs} segs)");
                 StopAndMarkIdle(key);
             }
 
             if (behind.Count == 0)
             {
-                Log($"Equalize: All {siblings.Count} qualities at {maxSegs} segs, nothing more to do");
+                Log($"Equalize: All {siblings.Count} qualities at {maxDur:F1}s, nothing more to do");
                 return;
             }
 
-            // ── Langsamere Qualität(en) weiter muxen lassen bis sie aufgeholt haben (unbegrenzt) ──
-            foreach (var (key, segs) in behind)
-                Log($"Equalize: {key} has {segs}/{maxSegs} segs — waiting until caught up");
+            // ── Langsamere Qualität(en) weiter muxen lassen bis sie aufgeholt haben ──
+            foreach (var (key, dur, segs) in behind)
+                Log($"Equalize: {key} has {dur:F1}s/{maxDur:F1}s ({segs} segs) — waiting until caught up");
 
-            const int pollMs = 1000;
-            const int maxWaitIterations = 3600; // 1 Stunde max
+            const int pollMs = 2000;
+            const int maxWaitMs = 300_000; // 5 Minuten max
             var pendingKeys = new HashSet<string>(behind.Select(b => b.key));
-            int waitIteration = 0;
+            int elapsed = 0;
 
-            while (pendingKeys.Count > 0 && waitIteration < maxWaitIterations)
+            while (pendingKeys.Count > 0 && elapsed < maxWaitMs)
             {
                 await Task.Delay(pollMs).ConfigureAwait(false);
-                waitIteration++;
+                elapsed += pollMs;
 
                 foreach (var key in pendingKeys.ToList())
                 {
                     if (!RunningProcesses.TryGetValue(key, out var proc))
                     {
-                        // Prozess schon beendet (fertig oder Fehler)
                         Log($"Equalize: {key} process ended during catch-up");
                         pendingKeys.Remove(key);
                         continue;
@@ -444,27 +587,34 @@ namespace Emby.InvidiousPlugin
 
                     var dir = Path.Combine(CacheDir, key);
                     var m3u8 = Path.Combine(dir, "stream.m3u8");
+                    double currentDur = 0;
                     int currentSegs = 0;
-                    try
+                    var content = SafeReadAllText(m3u8);
+                    if (content != null)
                     {
-                        if (File.Exists(m3u8))
-                            currentSegs = CountSegments(File.ReadAllText(m3u8));
+                        currentDur = ParseTotalDuration(content);
+                        currentSegs = CountSegments(content);
                     }
-                    catch { }
 
-                    if (currentSegs >= maxSegs)
+                    if (currentDur >= maxDur)
                     {
-                        // Ziel erreicht → sofort stoppen damit nicht weiter gemuxt wird
-                        Log($"Equalize: {key} reached {currentSegs}/{maxSegs} segs — stopping now");
-                        StopAndMarkIdle(key);
+                        if (key == triggeringKey)
+                        {
+                            Log($"Equalize: {key} (trigger) reached {currentDur:F1}s/{maxDur:F1}s ({currentSegs} segs) — caught up");
+                        }
+                        else
+                        {
+                            Log($"Equalize: {key} reached {currentDur:F1}s/{maxDur:F1}s ({currentSegs} segs) — stopping now");
+                            StopAndMarkIdle(key);
+                        }
                         pendingKeys.Remove(key);
                     }
                 }
             }
 
-            if (waitIteration >= maxWaitIterations)
+            if (pendingKeys.Count > 0)
             {
-                Log($"Equalize: Timeout after 1 hour, stopping remaining qualities");
+                Log($"Equalize: Timeout after {elapsed / 1000}s, stopping remaining qualities");
                 foreach (var key in pendingKeys)
                 {
                     StopAndMarkIdle(key);
@@ -499,12 +649,9 @@ namespace Emby.InvidiousPlugin
                 File.WriteAllText(idleMarker, $"{DateTime.UtcNow:O}\n{segs}");
 
                 UpdatePlaybackM3u8(m3u8, playbackPath);
-                if (File.Exists(playbackPath))
-                {
-                    var pc = File.ReadAllText(playbackPath);
-                    if (!pc.Contains("#EXT-X-ENDLIST"))
-                        File.WriteAllText(playbackPath, pc + "\n#EXT-X-ENDLIST\n");
-                }
+                // KEIN ENDLIST hinzufügen — der Player soll weiter pollen,
+                // damit der Session-Monitor bei erneutem Abspielen
+                // FFmpeg fortsetzen kann und neue Segmente erscheinen.
 
                 Log($"StopAndMarkIdle: {processKey} stopped ({segs} segs)");
             }
@@ -513,7 +660,6 @@ namespace Emby.InvidiousPlugin
                 Log($"StopAndMarkIdle error for {processKey}: {ex.Message}");
             }
 
-            MuxGate.Release();
             try { proc.Dispose(); } catch { }
         }
 
@@ -528,6 +674,209 @@ namespace Emby.InvidiousPlugin
                     count++;
             }
             return count;
+        }
+
+        private static int ParseHeightFromProcessKey(string processKey)
+        {
+            var lastUnderscore = processKey.LastIndexOf('_');
+            if (lastUnderscore < 0 || lastUnderscore + 2 >= processKey.Length)
+                return 0;
+
+            var suffix = processKey.Substring(lastUnderscore + 1);
+            if (!suffix.EndsWith("p", StringComparison.OrdinalIgnoreCase))
+                return 0;
+
+            var numberPart = suffix.Substring(0, suffix.Length - 1);
+            return int.TryParse(numberPart, out var height) ? height : 0;
+        }
+
+        private static bool IsHighestQualityForVideo(string videoId, string processKey)
+        {
+            var currentHeight = ParseHeightFromProcessKey(processKey);
+            var maxHeight = 0;
+
+            foreach (var key in RunningProcesses.Keys)
+            {
+                if (!key.StartsWith(videoId + "_", StringComparison.Ordinal))
+                    continue;
+
+                var h = ParseHeightFromProcessKey(key);
+                if (h > maxHeight) maxHeight = h;
+            }
+
+            if (maxHeight <= 0) return true;
+            return currentHeight >= maxHeight;
+        }
+
+        // ────────────────────────────────────────────────────────────
+        //  Session-Resume-Monitor: Prüft periodisch ob eine Session
+        //  ein Video abspielt, das einen idle_stopped Cache hat.
+        //  Falls ja → FFmpeg-Resume starten.
+        // ────────────────────────────────────────────────────────────
+        private static void StartSessionResumeMonitor(CancellationToken ct)
+        {
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(5000, ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) { return; }
+
+                Log("SessionResumeMonitor: Started");
+
+                while (!ct.IsCancellationRequested)
+                {
+                    try
+                    {
+                        await Task.Delay(3000, ct).ConfigureAwait(false);
+                        CheckForResumeOpportunities();
+                    }
+                    catch (OperationCanceledException) { break; }
+                    catch (Exception ex)
+                    {
+                        Log($"SessionResumeMonitor error: {ex.Message}");
+                    }
+                }
+                Log("SessionResumeMonitor: Stopped");
+            }, ct);
+        }
+
+        private static void CheckForResumeOpportunities()
+        {
+            var sm = Plugin.SessionManager;
+            if (sm == null) return;
+
+            try
+            {
+                if (!Directory.Exists(CacheDir)) return;
+
+                foreach (var dir in Directory.GetDirectories(CacheDir))
+                {
+                    var idleMarker = Path.Combine(dir, "idle_stopped");
+                    if (!File.Exists(idleMarker)) continue;
+
+                    var dirName = Path.GetFileName(dir);
+                    if (string.IsNullOrEmpty(dirName)) continue;
+
+                    // processKey = "videoId_heightp"
+                    var lastUnderscore = dirName.LastIndexOf('_');
+                    if (lastUnderscore < 0) continue;
+                    var videoId = dirName.Substring(0, lastUnderscore);
+
+                    // Läuft bereits ein Prozess für dieses Video?
+                    if (RunningProcesses.ContainsKey(dirName)) continue;
+                    // Wird bereits resumed?
+                    if (ResumeInProgress.ContainsKey(dirName)) continue;
+
+                    // Wird dieses Video gerade abgespielt?
+                    if (!IsVideoBeingPlayed(videoId)) continue;
+
+                    // Resume-Metadaten lesen
+                    var metaFile = Path.Combine(dir, "_resume_meta.txt");
+                    if (!File.Exists(metaFile)) continue;
+
+                    if (!ResumeInProgress.TryAdd(dirName, true)) continue;
+
+                    try
+                    {
+                        var lines = File.ReadAllLines(metaFile);
+                        if (lines.Length < 4)
+                        {
+                            ResumeInProgress.TryRemove(dirName, out _);
+                            continue;
+                        }
+
+                        int height = int.TryParse(lines[2], NumberStyles.Integer,
+                            CultureInfo.InvariantCulture, out var h) ? h : 0;
+                        bool isVp9 = bool.TryParse(lines[3], out var v) && v;
+
+                        if (height <= 0)
+                        {
+                            ResumeInProgress.TryRemove(dirName, out _);
+                            continue;
+                        }
+
+                        // URLs aus aktueller Config rekonstruieren (robust gegen URL-Änderungen)
+                        string? authHeader = null;
+                        string videoUrl, audioUrl;
+                        try
+                        {
+                            var cfgUrl = Plugin.Instance?.Options?.InvidiousUrl;
+                            if (string.IsNullOrEmpty(cfgUrl))
+                            {
+                                Log($"SessionResumeMonitor: No Invidious URL configured, skipping {dirName}");
+                                ResumeInProgress.TryRemove(dirName, out _);
+                                continue;
+                            }
+
+                            var cleanBase = InvidiousApi.GetCleanBaseUrl(cfgUrl);
+                            var hdrs = InvidiousApi.BuildPlaybackHeaders(cfgUrl);
+                            hdrs.TryGetValue("Authorization", out authHeader);
+
+                            if (lines[0].StartsWith("http", StringComparison.OrdinalIgnoreCase))
+                            {
+                                // Legacy format: full URLs
+                                videoUrl = lines[0];
+                                audioUrl = lines[1];
+                            }
+                            else
+                            {
+                                // New format: itags → frische URLs bauen
+                                videoUrl = $"{cleanBase}/latest_version?id={videoId}&itag={lines[0]}&local=true";
+                                audioUrl = $"{cleanBase}/latest_version?id={videoId}&itag={lines[1]}&local=true";
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"SessionResumeMonitor: Config error for {dirName}: {ex.Message}");
+                            ResumeInProgress.TryRemove(dirName, out _);
+                            continue;
+                        }
+
+                        Log($"SessionResumeMonitor: Resuming {dirName} (session active)");
+
+                        // ENDLIST aus playback.m3u8 entfernen
+                        PrepareForResume(videoId, height);
+
+                        // FFmpeg-Resume im Hintergrund starten
+                        var capturedVideoUrl = videoUrl;
+                        var capturedAudioUrl = audioUrl;
+                        var capturedHeight = height;
+                        var capturedIsVp9 = isVp9;
+                        var capturedAuth = authHeader;
+                        var capturedVideoId = videoId;
+                        var capturedDirName = dirName;
+
+                        _ = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                await MuxToHlsAsync(capturedVideoUrl, capturedAudioUrl,
+                                    capturedVideoId, capturedHeight, capturedIsVp9,
+                                    capturedAuth).ConfigureAwait(false);
+                            }
+                            catch (Exception ex)
+                            {
+                                Log($"SessionResumeMonitor: Resume failed for {capturedDirName}: {ex.Message}");
+                            }
+                            finally
+                            {
+                                ResumeInProgress.TryRemove(capturedDirName, out _);
+                            }
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"SessionResumeMonitor: Error for {dirName}: {ex.Message}");
+                        ResumeInProgress.TryRemove(dirName, out _);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"CheckForResumeOpportunities error: {ex.Message}");
+            }
         }
 
         public static async Task<string?> MuxToHlsAsync(
@@ -553,7 +902,7 @@ namespace Emby.InvidiousPlugin
                         ct.ThrowIfCancellationRequested();
                         await Task.Delay(PollIntervalMs, ct).ConfigureAwait(false);
 
-                        if (!RunningProcesses.ContainsKey(processKey)) 
+                        if (!RunningProcesses.ContainsKey(processKey))
                         {
                             Log($"Running process for {processKey} completed");
                             break;
@@ -583,7 +932,7 @@ namespace Emby.InvidiousPlugin
                         try
                         {
                             var fc = File.ReadAllText(playback);
-                            if (CountSegments(fc) >= 1) 
+                            if (CountSegments(fc) >= 1)
                             {
                                 Log($"Process completed, returning {CountSegments(fc)} segments");
                                 return playback;
@@ -631,7 +980,7 @@ namespace Emby.InvidiousPlugin
 
                         // Partieller Cache (idle-gestoppt) → Resume vorbereiten
                         var idleMarker = Path.Combine(videoDir, "idle_stopped");
-                        if (File.Exists(idleMarker) && CountSegments(cached) >= MinSegmentsForCache)
+                        if (File.Exists(idleMarker) && CountSegments(cached) >= MinSegmentsForResume)
                         {
                             Log($"RESUME: Found partial cache ({CountSegments(cached)} segs) for {processKey}");
                             resumeAttempted = true;
@@ -659,14 +1008,6 @@ namespace Emby.InvidiousPlugin
 
                 Directory.CreateDirectory(videoDir);
 
-                if (!await GetMuxGate().WaitAsync(TimeSpan.FromSeconds(30), ct)
-                    .ConfigureAwait(false))
-                {
-                    Log($"FAIL: Too many muxes ({ActiveMuxCount}), rejecting {processKey}");
-                    return null;
-                }
-
-                bool semaphoreOwnedByCaller = true;
                 try
                 {
                     var ffmpeg = FindFfmpeg();
@@ -674,7 +1015,7 @@ namespace Emby.InvidiousPlugin
                     string segExt = isVp9 ? "m4s" : "ts";
 
                     // ── Resume-Erkennung ──
-                    int startNumber = 0;
+                    bool isResume = false;
                     string seekArg = "";
                     var idleMarkerPath = Path.Combine(videoDir, "idle_stopped");
 
@@ -686,25 +1027,27 @@ namespace Emby.InvidiousPlugin
                             int existingSegs = CountSegments(existingContent);
                             double existingDuration = ParseTotalDuration(existingContent);
 
-                            if (existingSegs >= MinSegmentsForCache && existingDuration > 0)
+                            if (existingSegs >= MinSegmentsForResume)
                             {
-                                startNumber = existingSegs;
-                                // 2s Overlap für sauberen Übergang
-                                double seekSec = Math.Max(0, existingDuration - 2);
-                                seekArg = $"-ss {seekSec:F2} ";
-                                Log($"RESUME: Starting at seg {startNumber}, seeking to {seekSec:F1}s (total cached: {existingDuration:F1}s)");
+                                isResume = true;
+                                // Exakt an der letzten Position fortsetzen (kein Overlap)
+                                // FFmpeg input-seek springt zum nächsten Keyframe davor,
+                                // append_list setzt die Timeline nahtlos fort.
+                                double seekSec = existingDuration;
+                                seekArg = $"-ss {seekSec.ToString("F2", CultureInfo.InvariantCulture)} ";
+                                Log($"RESUME: {existingSegs} segs cached ({existingDuration.ToString("F1", CultureInfo.InvariantCulture)}s), seeking to {seekSec.ToString("F1", CultureInfo.InvariantCulture)}s");
 
                                 // Idle-Marker löschen
                                 try { File.Delete(idleMarkerPath); } catch { }
 
-                                // #EXT-X-ENDLIST aus stream.m3u8 entfernen falls vorhanden
-                                // und #EXT-X-DISCONTINUITY einfügen → signalisiert Emby
-                                // dass sich Timestamps/Codecs ändern können (kein Stottern)
+                                // #EXT-X-ENDLIST entfernen damit Emby weiter pollt.
+                                // KEIN DISCONTINUITY einfügen — das bricht Emby's Seeking.
+                                // append_list übernimmt Segment-Nummerierung automatisch.
                                 if (existingContent.Contains("#EXT-X-ENDLIST"))
                                 {
                                     existingContent = existingContent.Replace("#EXT-X-ENDLIST", "").TrimEnd();
                                 }
-                                existingContent += "\n#EXT-X-DISCONTINUITY\n";
+                                existingContent += "\n";
                                 File.WriteAllText(m3u8, existingContent);
                             }
                             else
@@ -748,6 +1091,13 @@ namespace Emby.InvidiousPlugin
                         ? $"-headers \"Authorization: {authHeader}\r\n\" "
                         : "";
 
+                    // Bei Resume: kein -avoid_negative_ts make_zero, damit PTS
+                    // aus dem Input-Seek beibehalten werden und die HLS-Timeline
+                    // nahtlos fortgesetzt wird. Auch kein -start_number, da
+                    // append_list die Segment-Nummerierung aus der bestehenden
+                    // m3u8 automatisch fortsetzt.
+                    string avoidNegTs = isResume ? "" : "-avoid_negative_ts make_zero ";
+
                     var args =
                         $"-y " +
                         $"-probesize 10M -analyzeduration 5M " +
@@ -765,15 +1115,31 @@ namespace Emby.InvidiousPlugin
                         $"-i \"{directAudioUrl}\" " +
                         $"-map 0:v:0 -map 1:a:0 " +
                         $"-fflags +genpts+discardcorrupt " +
-                        $"-avoid_negative_ts make_zero " +
+                        $"{avoidNegTs}" +
                         $"-max_muxing_queue_size 4096 " +
                         $"{codecArgs} " +
                         $"-f hls -hls_time 4 " +
                         $"-hls_list_size 0 -hls_flags append_list " +
-                        $"-start_number {startNumber} " +
                         $"-hls_segment_filename \"{segPattern}\" \"{m3u8}\"";
 
-                    Log($"Starting FFmpeg: {ffmpeg}");
+                    // Resume-Metadaten speichern (itags für URL-Rekonstruktion)
+                    try
+                    {
+                        var metaFile = Path.Combine(videoDir, "_resume_meta.txt");
+                        var videoItag = ExtractQueryParam(directVideoUrl, "itag") ?? "0";
+                        var audioItag = ExtractQueryParam(directAudioUrl, "itag") ?? "0";
+                        File.WriteAllLines(metaFile, new[]
+                        {
+                            videoItag,
+                            audioItag,
+                            height.ToString(CultureInfo.InvariantCulture),
+                            isVp9.ToString(),
+                        });
+                    }
+                    catch (Exception ex) { Log($"Save resume meta error: {ex.Message}"); }
+
+                    Log($"Starting FFmpeg: {ffmpeg} [resume={isResume}]");
+                    Log($"FFmpeg args: {args}");
                     var psi = new ProcessStartInfo
                     {
                         FileName = ffmpeg,
@@ -792,7 +1158,6 @@ namespace Emby.InvidiousPlugin
                     }
 
                     RunningProcesses[processKey] = process;
-                    semaphoreOwnedByCaller = false;
                     Log($"FFmpeg PID={process.Id} for {processKey}");
 
                     _ = Task.Run(async () =>
@@ -847,10 +1212,7 @@ namespace Emby.InvidiousPlugin
                                 }
                             }
 
-                            var wasRemoved = RunningProcesses.TryRemove(processKey, out _);
-                            // Nur releasen wenn WIR den Prozess entfernt haben
-                            // (nicht wenn der Idle-Watchdog es schon getan hat)
-                            if (wasRemoved) MuxGate.Release();
+                            RunningProcesses.TryRemove(processKey, out _);
                             try { process.Dispose(); } catch { }
                         }
                     });
@@ -870,7 +1232,10 @@ namespace Emby.InvidiousPlugin
                             {
                                 int currentSegs = 0;
                                 if (File.Exists(m3u8))
-                                    currentSegs = CountSegments(File.ReadAllText(m3u8));
+                                {
+                                    var watchdogContent = SafeReadAllText(m3u8);
+                                    if (watchdogContent != null) currentSegs = CountSegments(watchdogContent);
+                                }
 
                                 if (currentSegs > lastSegCount)
                                 {
@@ -886,8 +1251,52 @@ namespace Emby.InvidiousPlugin
                                         lastSessionSeen = DateTime.UtcNow;
                                 }
 
-                                bool noSession = (DateTime.UtcNow - lastSessionSeen).TotalMilliseconds >= SessionGraceMs;
-                                bool ffmpegStalled = (DateTime.UtcNow - lastNewSegTime).TotalMilliseconds >= IdleTimeoutMs;
+                                bool activeSession = (DateTime.UtcNow - lastSessionSeen).TotalMilliseconds < GetSessionGraceMs();
+
+                                // ── Pre-Buffer-Limit: Kein Zuschauer → nach X Segmenten stoppen ──
+                                if (!activeSession && currentSegs >= GetPreBufferSegments())
+                                {
+                                    bool processStillRunning = false;
+                                    if (RunningProcesses.TryGetValue(processKey, out var pbCheck))
+                                    {
+                                        try { processStillRunning = !pbCheck.HasExited; }
+                                        catch { }
+                                    }
+                                    if (processStillRunning)
+                                    {
+                                        if (!IsHighestQualityForVideo(videoId, processKey))
+                                        {
+                                            await Task.Delay(1000).ConfigureAwait(false);
+                                            continue;
+                                        }
+                                        if (StopInProgress.TryAdd(videoId, true))
+                                        {
+                                            try
+                                            {
+                                                Log($"PRE-BUFFER: {processKey} reached {currentSegs} segs (max={GetPreBufferSegments()}), no active viewer — stopping");
+                                                await EqualizeBeforeStop(videoId, processKey).ConfigureAwait(false);
+                                                Log($"PRE-BUFFER: Equalization done for {videoId}");
+                                                var allKeys = RunningProcesses.Keys
+                                                    .Where(k => k.StartsWith(videoId + "_", StringComparison.Ordinal))
+                                                    .ToList();
+                                                foreach (var key in allKeys)
+                                                    StopAndMarkIdle(key);
+                                                StopAndMarkIdle(processKey);
+                                            }
+                                            finally { StopInProgress.TryRemove(videoId, out _); }
+                                            break;
+                                        }
+                                        else
+                                        {
+                                            while (StopInProgress.ContainsKey(videoId))
+                                                await Task.Delay(500).ConfigureAwait(false);
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                bool noSession = !activeSession;
+                                bool ffmpegStalled = (DateTime.UtcNow - lastNewSegTime).TotalMilliseconds >= GetIdleTimeoutMs(isVp9);
 
                                 if (noSession || ffmpegStalled)
                                 {
@@ -900,6 +1309,14 @@ namespace Emby.InvidiousPlugin
 
                                     if (!processStillRunning)
                                         break;
+
+                                    // Stop/Equalize nur von der höchsten Qualitätsstufe starten,
+                                    // damit höhere Qualitäten nicht vorzeitig separat gestoppt werden.
+                                    if (!IsHighestQualityForVideo(videoId, processKey))
+                                    {
+                                        await Task.Delay(1000).ConfigureAwait(false);
+                                        continue;
+                                    }
 
                                     // Nur EIN Watchdog pro Video darf stoppen
                                     if (!StopInProgress.TryAdd(videoId, true))
@@ -998,8 +1415,6 @@ namespace Emby.InvidiousPlugin
                 }
                 catch
                 {
-                    if (semaphoreOwnedByCaller)
-                        MuxGate.Release();
                     throw;
                 }
             }
@@ -1037,6 +1452,17 @@ namespace Emby.InvidiousPlugin
 
         private static string FindFfmpeg()
         {
+            try
+            {
+                var configPath = Plugin.Instance?.Options?.FfmpegPath;
+                if (!string.IsNullOrWhiteSpace(configPath))
+                {
+                    if (File.Exists(configPath)) return configPath;
+                    Log($"Configured FFmpeg path not found: {configPath}");
+                }
+            }
+            catch { }
+
             var fromPath = FindInSystemPath("ffmpeg");
             if (!string.IsNullOrEmpty(fromPath)) return fromPath!;
 

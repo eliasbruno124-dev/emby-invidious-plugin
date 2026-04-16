@@ -7,14 +7,14 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <None Remove="thumb.png" />
-  </ItemGroup>
-
-  <ItemGroup>
     <EmbeddedResource Include="thumb.png" />
+    <Content Include="thumb.png">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="MediaBrowser.Common" Version="4.9.1.90" />
     <PackageReference Include="MediaBrowser.Server.Core" Version="4.9.1.90" />
   </ItemGroup>
 

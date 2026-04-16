@@ -4,8 +4,11 @@ using MediaBrowser.Controller;
 using MediaBrowser.Controller.Plugins;
 using MediaBrowser.Controller.Session;
 using MediaBrowser.Model.Drawing;
+using MediaBrowser.Model.Plugins;
 using System;
+using System.Globalization;
 using System.IO;
+using System.Reflection;
 
 namespace Emby.InvidiousPlugin
 {
@@ -30,13 +33,58 @@ namespace Emby.InvidiousPlugin
 
         public PluginConfiguration Options => GetOptions();
 
+        public ImageFormat ThumbImageFormat => ImageFormat.Png;
+
+        public override PluginInfo GetPluginInfo()
+        {
+            var info = base.GetPluginInfo();
+            var assemblyDir = Path.GetDirectoryName(AssemblyFilePath) ?? string.Empty;
+            var thumbPath = Path.Combine(assemblyDir, "thumb.png");
+
+            if (File.Exists(thumbPath))
+            {
+                var imageTag = File.GetLastWriteTimeUtc(thumbPath)
+                    .Ticks
+                    .ToString(CultureInfo.InvariantCulture);
+
+                // Emby builds differ: some expect ImageTag, others ImageUrl.
+                SetStringPropertyIfExists(info, "ImageTag", imageTag);
+
+                var pngBytes = File.ReadAllBytes(thumbPath);
+                var imageDataUrl = "data:image/png;base64," + Convert.ToBase64String(pngBytes);
+                SetStringPropertyIfExists(info, "ImageUrl", imageDataUrl);
+            }
+
+            return info;
+        }
+
+        private static void SetStringPropertyIfExists(object target, string propertyName, string value)
+        {
+            var property = target.GetType().GetProperty(
+                propertyName,
+                BindingFlags.Public | BindingFlags.Instance);
+
+            if (property?.CanWrite == true && property.PropertyType == typeof(string))
+            {
+                property.SetValue(target, value);
+            }
+        }
+
         public Stream GetThumbImage()
         {
             var type = GetType();
             var stream = type.Assembly.GetManifestResourceStream(type.Namespace + ".thumb.png");
             return stream ?? new MemoryStream();
         }
+    }
 
-        public ImageFormat ThumbImageFormat => ImageFormat.Png;
+    public class PluginEntryPoint : IServerEntryPoint
+    {
+        public void Run() { }
+
+        public void Dispose()
+        {
+            MuxHelper.Shutdown();
+        }
     }
 }
