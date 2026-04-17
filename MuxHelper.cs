@@ -1420,7 +1420,8 @@ namespace Emby.InvidiousPlugin
                         DateTime lastNewSegTime = DateTime.UtcNow;
                         DateTime lastSessionSeen = DateTime.UtcNow;
                         DateTime muxStartedAt = DateTime.UtcNow;
-                        const int InitialGraceMs = 45_000; // Emby needs 25-40s to populate session info
+                        const int InitialGraceMs = 120_000; // Emby needs 60-90s to populate session info for channel items
+                        bool sessionEverDetected = false;
                         int tickCounter = 0;
 
                         while (RunningProcesses.ContainsKey(processKey))
@@ -1451,7 +1452,14 @@ namespace Emby.InvidiousPlugin
                                 if ((tickCounter % (SessionCheckMs / PlaybackUpdateIntervalMs)) == 0)
                                 {
                                     if (HasRecentAccess(videoId, GetSessionGraceMs()) || IsVideoBeingPlayed(videoId))
+                                    {
                                         lastSessionSeen = DateTime.UtcNow;
+                                        if (!sessionEverDetected)
+                                        {
+                                            sessionEverDetected = true;
+                                            Log($"SESSION-DETECTED: {processKey} — viewer confirmed, will not pre-buffer-stop");
+                                        }
+                                    }
                                 }
 
                                 // During the initial grace period, assume session is active.
@@ -1466,7 +1474,9 @@ namespace Emby.InvidiousPlugin
                                 bool activeSession = (DateTime.UtcNow - lastSessionSeen).TotalMilliseconds < GetSessionGraceMs();
 
                                 // ── Pre-buffer limit: no viewer → stop after X segments ──
-                                if (!activeSession && currentSegs >= GetPreBufferSegments())
+                                // Skip if session was ever detected — Emby might just have
+                                // slow session refresh and the viewer is still watching.
+                                if (!activeSession && !sessionEverDetected && currentSegs >= GetPreBufferSegments())
                                 {
                                     bool processStillRunning = false;
                                     if (RunningProcesses.TryGetValue(processKey, out var pbCheck))
@@ -1508,7 +1518,9 @@ namespace Emby.InvidiousPlugin
                                     }
                                 }
 
-                                bool noSession = !activeSession;
+                                // If session was ever detected, only stop on FFmpeg stall,
+                                // not on session timeout (Emby session data is unreliable for channels)
+                                bool noSession = !activeSession && !sessionEverDetected;
                                 bool ffmpegStalled = (DateTime.UtcNow - lastNewSegTime).TotalMilliseconds >= GetIdleTimeoutMs(isVp9);
 
                                 if (noSession || ffmpegStalled)
