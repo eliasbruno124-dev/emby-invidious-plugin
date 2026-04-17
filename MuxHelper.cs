@@ -41,6 +41,7 @@ namespace Emby.InvidiousPlugin
 
                 foreach (var session in sm.Sessions)
                 {
+                    // 1) NowPlayingItem.Path (works for direct/HLS with filesystem paths)
                     var item = session.NowPlayingItem;
                     if (item != null)
                     {
@@ -49,9 +50,31 @@ namespace Emby.InvidiousPlugin
                             return true;
                     }
 
+                    // 2) PlayState.MediaSourceId (e.g. "videoId_hls_1080p")
                     var sourceId = session.PlayState?.MediaSourceId ?? "";
-                    if (sourceId.Contains(videoId, StringComparison.OrdinalIgnoreCase))
+                    if (!string.IsNullOrEmpty(sourceId)
+                        && sourceId.Contains(videoId, StringComparison.OrdinalIgnoreCase))
                         return true;
+
+                    // 3) FullNowPlayingItem — full BaseItem entity with ExternalId
+                    //    For channel items ExternalId = channel item ID = raw videoId
+                    try
+                    {
+                        var fullItem = session.FullNowPlayingItem;
+                        if (fullItem != null)
+                        {
+                            var extId = fullItem.ExternalId;
+                            if (!string.IsNullOrEmpty(extId)
+                                && extId.Contains(videoId, StringComparison.OrdinalIgnoreCase))
+                                return true;
+
+                            var fullPath = fullItem.Path;
+                            if (!string.IsNullOrEmpty(fullPath)
+                                && fullPath.Contains(videoId, StringComparison.OrdinalIgnoreCase))
+                                return true;
+                        }
+                    }
+                    catch { /* FullNowPlayingItem may not exist in all Emby versions */ }
                 }
             }
             catch (Exception ex)
@@ -61,7 +84,56 @@ namespace Emby.InvidiousPlugin
             return false;
         }
 
-        private const int MinSegmentsForPlayback = 3;
+        /// <summary>
+        /// Logs a diagnostic dump of all active Emby sessions (called once per mux start).
+        /// </summary>
+        private static void LogSessionDiagnostics(string context)
+        {
+            try
+            {
+                var sm = Plugin.SessionManager;
+                if (sm == null) { Log($"SessionDiag[{context}]: SessionManager is null"); return; }
+
+                int count = 0;
+                foreach (var session in sm.Sessions)
+                {
+                    count++;
+                    var item = session.NowPlayingItem;
+                    var ps = session.PlayState;
+                    string itemPath = item?.Path ?? "(null)";
+                    string itemName = item?.Name ?? "(null)";
+                    string srcId = ps?.MediaSourceId ?? "(null)";
+                    string isPaused = ps?.IsPaused.ToString() ?? "(null)";
+
+                    string extId = "(n/a)";
+                    string fullPath = "(n/a)";
+                    try
+                    {
+                        var fi = session.FullNowPlayingItem;
+                        if (fi != null)
+                        {
+                            extId = fi.ExternalId ?? "(null)";
+                            fullPath = fi.Path ?? "(null)";
+                        }
+                        else extId = "(null-item)";
+                    }
+                    catch { extId = "(err)"; }
+
+                    Log($"SessionDiag[{context}]: #{count} Client={session.Client} " +
+                        $"Item.Path={itemPath} Item.Name={itemName} " +
+                        $"MediaSourceId={srcId} Paused={isPaused} " +
+                        $"FullItem.ExternalId={extId} FullItem.Path={fullPath}");
+                }
+                if (count == 0)
+                    Log($"SessionDiag[{context}]: No active sessions");
+            }
+            catch (Exception ex)
+            {
+                Log($"SessionDiag[{context}] error: {ex.Message}");
+            }
+        }
+
+        private const int MinSegmentsForPlayback = 1;
         private const int MinSegmentsForCache = 6;
         private const int MinSegmentsForResume = 1;
         private const int SegmentWaitMaxIterations = 300;
@@ -122,24 +194,6 @@ namespace Emby.InvidiousPlugin
             try { _monitorCts?.Dispose(); } catch { }
             _monitorCts = new CancellationTokenSource();
             StartSessionResumeMonitor(_monitorCts.Token);
-        }
-
-        /// <summary>
-        /// Can be called externally to re-initialize MuxHelper
-        /// (e.g. after plugin reload). Thread-safe and idempotent.
-        /// </summary>
-        private static bool _initialized;
-        private static readonly object InitLock = new();
-        public static void EnsureInitialized()
-        {
-            if (_initialized) return;
-            lock (InitLock)
-            {
-                if (_initialized) return;
-                _initialized = true;
-                // Static ctor already called Initialize().
-                // On plugin reload: re-initialize.
-            }
         }
 
         /// <summary>
@@ -259,32 +313,6 @@ namespace Emby.InvidiousPlugin
             catch (Exception ex)
             {
                 Debug.WriteLine($"[MuxHelper] Log write failed: {ex.Message}");
-            }
-        }
-
-        public static int ActiveMuxCount => RunningProcesses.Count;
-
-        public static void KillProcess(string videoId)
-        {
-            foreach (var key in RunningProcesses.Keys)
-            {
-                if (key == videoId
-                    || key.StartsWith(videoId + "_", StringComparison.Ordinal))
-                {
-                    if (RunningProcesses.TryRemove(key, out var proc))
-                    {
-                        try
-                        {
-                            if (!proc.HasExited)
-                            {
-                                proc.Kill();
-                                Log($"Killed FFmpeg for {key}");
-                            }
-                        }
-                        catch (Exception ex) { Log($"Kill failed for {key}: {ex.Message}"); }
-                        finally { try { proc.Dispose(); } catch { } }
-                    }
-                }
             }
         }
 
@@ -953,6 +981,7 @@ namespace Emby.InvidiousPlugin
         {
             var processKey = $"{videoId}_{height}p";
             Log($"--- MuxToHlsAsync: {processKey} (codec={(isVp9 ? "vp9" : "h264")})");
+            LogSessionDiagnostics(processKey);
 
             try
             {
@@ -1166,7 +1195,7 @@ namespace Emby.InvidiousPlugin
 
                     var args =
                         $"-y " +
-                        $"-probesize 10M -analyzeduration 5M " +
+                        $"-probesize 1M -analyzeduration 2M " +
                         $"{seekArg}" +
                         $"-reconnect 1 -reconnect_streamed 1 " +
                         $"-reconnect_delay_max 5 " +
@@ -1184,7 +1213,7 @@ namespace Emby.InvidiousPlugin
                         $"{avoidNegTs}" +
                         $"-max_muxing_queue_size 4096 " +
                         $"{codecArgs} " +
-                        $"-f hls -hls_time 4 " +
+                        $"-f hls -hls_init_time 1 -hls_time 4 " +
                         $"-hls_list_size 0 -hls_flags append_list " +
                         $"-hls_segment_filename \"{segPattern}\" \"{m3u8}\"";
 
@@ -1288,6 +1317,8 @@ namespace Emby.InvidiousPlugin
                         int lastSegCount = 0;
                         DateTime lastNewSegTime = DateTime.UtcNow;
                         DateTime lastSessionSeen = DateTime.UtcNow;
+                        DateTime muxStartedAt = DateTime.UtcNow;
+                        const int InitialGraceMs = 45_000; // Emby needs 25-40s to populate session info
                         int tickCounter = 0;
 
                         while (RunningProcesses.ContainsKey(processKey))
@@ -1319,6 +1350,11 @@ namespace Emby.InvidiousPlugin
 
                                 bool activeSession = (DateTime.UtcNow - lastSessionSeen).TotalMilliseconds < GetSessionGraceMs();
 
+                                // During the initial grace period, assume session is active
+                                // (Emby needs 25-40s to populate NowPlayingItem for channel items)
+                                bool inInitialGrace = (DateTime.UtcNow - muxStartedAt).TotalMilliseconds < InitialGraceMs;
+                                if (inInitialGrace) activeSession = true;
+
                                 // ── Pre-buffer limit: no viewer → stop after X segments ──
                                 if (!activeSession && currentSegs >= GetPreBufferSegments())
                                 {
@@ -1340,6 +1376,7 @@ namespace Emby.InvidiousPlugin
                                             try
                                             {
                                                 Log($"PRE-BUFFER: {processKey} reached {currentSegs} segs (max={GetPreBufferSegments()}), no active viewer — stopping");
+                                                LogSessionDiagnostics($"PRE-BUFFER-STOP:{processKey}");
                                                 await EqualizeBeforeStop(videoId, processKey).ConfigureAwait(false);
                                                 Log($"PRE-BUFFER: Equalization done for {videoId}");
                                                 var allKeys = RunningProcesses.Keys
@@ -1398,6 +1435,7 @@ namespace Emby.InvidiousPlugin
                                     {
                                         string reason = noSession ? "no session" : "FFmpeg stalled";
                                         Log($"STOP: {reason} ({currentSegs} segs), equalizing {processKey}");
+                                        if (noSession) LogSessionDiagnostics($"STOP:{processKey}");
 
                                         await EqualizeBeforeStop(videoId, processKey).ConfigureAwait(false);
                                         Log($"STOP: Equalization done for {videoId}");

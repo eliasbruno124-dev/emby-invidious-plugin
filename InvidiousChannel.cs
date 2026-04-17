@@ -40,10 +40,37 @@ namespace Emby.InvidiousPlugin
         private static readonly ConcurrentDictionary<string, VideoMeta> MetaCache = new();
         private static readonly TimeSpan MetaCacheTtl = TimeSpan.FromDays(365);
 
+        // Negative‐cache entries older than this get retried
+        private static readonly TimeSpan NegativeCacheTtl = TimeSpan.FromHours(1);
+
         // ── RATE LIMITER: prevents API blocking ──
-        // Max 4 concurrent enrichment calls + minimum 150ms delay per call
+        // Max 4 concurrent enrichment calls + minimum 200ms delay per call
         private static readonly SemaphoreSlim EnrichSemaphore = new(4, 4);
-        private const int EnrichDelayMs = 150;
+        private const int EnrichDelayMs = 200;
+        private const int MaxForegroundEnrich = 0; // all enrichment in background → instant channel loading
+
+        /// <summary>True if the item should be enriched via the full video API.</summary>
+        private static bool NeedsEnrichment(ChannelItemInfo item)
+        {
+            if (MetaCache.TryGetValue(item.Id, out var cached))
+            {
+                // Allow retry of negative cache entries (failed enrichment)
+                if (cached.Overview == null
+                    && (DateTime.UtcNow - cached.CachedAt) > NegativeCacheTtl)
+                    return true;
+                return false; // already enriched (or recently failed)
+            }
+            // Not in cache at all → needs enrichment
+            // Also treat truncated list‐API descriptions as needing enrichment
+            if (string.IsNullOrEmpty(item.Overview)) return true;
+            var text = item.Overview.TrimEnd();
+            if (text.EndsWith("...", StringComparison.Ordinal)
+                || text.EndsWith("\u2026", StringComparison.Ordinal))
+                return true;
+            if (!item.PremiereDate.HasValue || !item.RunTimeTicks.HasValue)
+                return true;
+            return false;
+        }
 
         public ChannelFeatures GetChannelFeatures()
         {
@@ -96,57 +123,59 @@ namespace Emby.InvidiousPlugin
                     var savedItems = (config.SavedItems ?? "")
                         .Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
 
-                    var menuTasks = savedItems.Select(async s =>
+                    // Sequential loading to avoid API burst → prevents blocking
+                    foreach (var s in savedItems)
                     {
                         var term = s.Trim();
-                        if (string.IsNullOrEmpty(term)) return null;
+                        if (string.IsNullOrEmpty(term)) continue;
+                        cancellationToken.ThrowIfCancellationRequested();
 
                         if (term.StartsWith(HandlePrefix))
                         {
                             var d = await InvidiousApi.GetChannelDetailsAsync(
                                 baseUrl, term, true, cancellationToken).ConfigureAwait(false);
-                            return new ChannelItemInfo
+                            items.Add(new ChannelItemInfo
                             {
                                 Name = d.name ?? term,
                                 Id = $"channel{FolderSeparator}{d.id ?? term}",
                                 Type = ChannelItemType.Folder,
                                 ImageUrl = d.thumb
-                            };
+                            });
                         }
-                        if (term.StartsWith(ChannelIdPrefix) && term.Length > MinChannelIdLength)
+                        else if (term.StartsWith(ChannelIdPrefix) && term.Length > MinChannelIdLength)
                         {
                             var d = await InvidiousApi.GetChannelDetailsAsync(
                                 baseUrl, term, false, cancellationToken).ConfigureAwait(false);
-                            return new ChannelItemInfo
+                            items.Add(new ChannelItemInfo
                             {
                                 Name = d.name ?? "Channel",
                                 Id = $"channel{FolderSeparator}{term}",
                                 Type = ChannelItemType.Folder,
                                 ImageUrl = d.thumb
-                            };
+                            });
                         }
-                        if (term.StartsWith(PlaylistPrefix))
+                        else if (term.StartsWith(PlaylistPrefix))
                         {
                             var d = await InvidiousApi.GetPlaylistDetailsAsync(
                                 baseUrl, term, cancellationToken).ConfigureAwait(false);
-                            return new ChannelItemInfo
+                            items.Add(new ChannelItemInfo
                             {
                                 Name = d.name ?? "Playlist",
                                 Id = $"playlist{FolderSeparator}{term}",
                                 Type = ChannelItemType.Folder,
                                 ImageUrl = d.thumb
-                            };
+                            });
                         }
-                        return new ChannelItemInfo
+                        else
                         {
-                            Name = $"Search: {term}",
-                            Id = $"search{FolderSeparator}{term}",
-                            Type = ChannelItemType.Folder
-                        };
-                    });
-
-                    foreach (var res in await Task.WhenAll(menuTasks).ConfigureAwait(false))
-                        if (res != null) items.Add(res);
+                            items.Add(new ChannelItemInfo
+                            {
+                                Name = $"Search: {term}",
+                                Id = $"search{FolderSeparator}{term}",
+                                Type = ChannelItemType.Folder
+                            });
+                        }
+                    }
 
                     return new ChannelItemResult
                     {
@@ -226,20 +255,32 @@ namespace Emby.InvidiousPlugin
                         // ── Cache lookup + selective enrichment ──
                         ApplyCachedMeta(batch);
 
-                        // Enrich all videos not yet in cache
-                        // (list API only returns truncated descriptions)
-                        var uncached = batch
-                            .Where(i => !MetaCache.ContainsKey(i.Id))
-                            .ToList();
-
-                        if (uncached.Count > 0)
                         {
-                            await EnrichVideosThrottled(
-                                baseUrl, uncached, cancellationToken).ConfigureAwait(false);
-                            EvictExpiredMetaCache();
-                            // After enrichment, apply cache again
-                            // so full descriptions are set
-                            ApplyCachedMeta(batch);
+                            var uncached = batch
+                                .Where(NeedsEnrichment)
+                                .ToList();
+
+                            if (uncached.Count > 0)
+                            {
+                                // Enrich a few synchronously so the user sees some descriptions
+                                var foreground = uncached.Take(MaxForegroundEnrich).ToList();
+                                await EnrichVideosThrottled(
+                                    baseUrl, foreground, cancellationToken).ConfigureAwait(false);
+                                EvictExpiredMetaCache();
+                                ApplyCachedMeta(batch);
+
+                                // Enrich the rest in the background (non-blocking)
+                                var background = uncached.Skip(MaxForegroundEnrich).ToList();
+                                if (background.Count > 0)
+                                {
+                                    var bgUrl = baseUrl;
+                                    _ = Task.Run(async () =>
+                                    {
+                                        try { await EnrichVideosThrottled(bgUrl, background, CancellationToken.None).ConfigureAwait(false); EvictExpiredMetaCache(); }
+                                        catch { }
+                                    });
+                                }
+                            }
                         }
 
                         foreach (var item in batch)
@@ -411,17 +452,23 @@ namespace Emby.InvidiousPlugin
 
             try
             {
-                var tasks = new List<Task<JsonDocument?>>
+                // Sequential loading to avoid API burst → prevents blocking
+                string?[] categories = { null, "music", "gaming", "movies" };
+                var popularDoc = await SafeGetJson(
+                    () => InvidiousApi.GetPopularAsync(baseUrl, ct)).ConfigureAwait(false);
+                if (popularDoc != null)
                 {
-                    SafeGetJson(() => InvidiousApi.GetPopularAsync(baseUrl, ct)),
-                    SafeGetJson(() => InvidiousApi.GetTrendingAsync(baseUrl, null, ct, reg)),
-                    SafeGetJson(() => InvidiousApi.GetTrendingAsync(baseUrl, "music", ct, reg)),
-                    SafeGetJson(() => InvidiousApi.GetTrendingAsync(baseUrl, "gaming", ct, reg)),
-                    SafeGetJson(() => InvidiousApi.GetTrendingAsync(baseUrl, "movies", ct, reg)),
-                };
-                var results = await Task.WhenAll(tasks).ConfigureAwait(false);
-                foreach (var doc in results)
+                    foreach (var v in ExtractVideos(popularDoc))
+                        if (seenIds.Add(v.Id)) allVideos.Add(v);
+                    popularDoc.Dispose();
+                }
+
+                foreach (var cat in categories)
                 {
+                    ct.ThrowIfCancellationRequested();
+                    var doc = await SafeGetJson(
+                        () => InvidiousApi.GetTrendingAsync(baseUrl, cat, ct, reg))
+                        .ConfigureAwait(false);
                     if (doc == null) continue;
                     foreach (var v in ExtractVideos(doc))
                         if (seenIds.Add(v.Id)) allVideos.Add(v);
@@ -438,15 +485,29 @@ namespace Emby.InvidiousPlugin
 
             // ── Enrichment: load descriptions for trending videos ──
             ApplyCachedMeta(allVideos);
-            var uncached = allVideos
-                .Where(i => string.IsNullOrEmpty(i.Overview)
-                            && !MetaCache.ContainsKey(i.Id))
-                .ToList();
-            if (uncached.Count > 0)
             {
-                await EnrichVideosThrottled(baseUrl, uncached, ct)
-                    .ConfigureAwait(false);
-                EvictExpiredMetaCache();
+                var uncached = allVideos
+                    .Where(NeedsEnrichment)
+                    .ToList();
+                if (uncached.Count > 0)
+                {
+                    var foreground = uncached.Take(MaxForegroundEnrich).ToList();
+                    await EnrichVideosThrottled(baseUrl, foreground, ct)
+                        .ConfigureAwait(false);
+                    EvictExpiredMetaCache();
+                    ApplyCachedMeta(allVideos);
+
+                    var background = uncached.Skip(MaxForegroundEnrich).ToList();
+                    if (background.Count > 0)
+                    {
+                        var bgUrl = baseUrl;
+                        _ = Task.Run(async () =>
+                        {
+                            try { await EnrichVideosThrottled(bgUrl, background, CancellationToken.None).ConfigureAwait(false); EvictExpiredMetaCache(); }
+                            catch { }
+                        });
+                    }
+                }
             }
 
             for (int i = 0; i < allVideos.Count; i++)
@@ -598,6 +659,12 @@ namespace Emby.InvidiousPlugin
                         && !url.Contains("ggpht.com", StringComparison.Ordinal))
                         continue;
 
+                    // Skip maxres/maxresdefault — not guaranteed to exist (404)
+                    var quality = InvidiousApi.GetString(t, "quality");
+                    if (quality != null
+                        && quality.StartsWith("maxres", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
                     var w = InvidiousApi.GetInt(t, "width") ?? 0;
                     if (w >= bestWidth) { bestWidth = w; bestUrl = url; }
                 }
@@ -631,7 +698,7 @@ namespace Emby.InvidiousPlugin
 
             try
             {
-                using var videoDoc = await InvidiousApi.GetVideoAsync(
+                using var videoDoc = await InvidiousApi.GetVideoDirectAsync(
                     baseUrl, videoId, cancellationToken).ConfigureAwait(false);
                 var root = videoDoc.RootElement;
 
@@ -984,9 +1051,9 @@ namespace Emby.InvidiousPlugin
         private static async Task QuickWaitForFirstSegment(
             string playbackPath, CancellationToken ct)
         {
-            const int maxMs = 12000;
-            const int pollMs = 300;
-            const int minSegments = 3;
+            const int maxMs = 5000;
+            const int pollMs = 200;
+            const int minSegments = 1;
             int waited = 0;
 
             while (waited < maxMs)

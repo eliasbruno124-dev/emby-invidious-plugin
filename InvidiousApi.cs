@@ -28,19 +28,29 @@ namespace Emby.InvidiousPlugin
             }
         };
 
-        private static readonly int[] RetryDelaysMs = { 800, 2500 };
+        private static readonly int[] RetryDelaysMs = { 1500, 4000 };
 
-        // ── NEU: Globaler Rate Limiter ──
-        // Max 3 gleichzeitige API-Calls + 200ms Mindestabstand
-        private static readonly SemaphoreSlim ApiGate = new(3, 3);
+        // ── Globaler Rate Limiter ──
+        // Max 6 gleichzeitige API-Calls + 100ms Mindestabstand
+        private static readonly SemaphoreSlim ApiGate = new(6, 6);
         private static long _lastCallTicks = 0;
-        private const int MinCallIntervalMs = 200;
+        private const int MinCallIntervalMs = 100;
+
+        // ── Request-Budget: max 60 Requests pro 60s ──
+        private static readonly Queue<long> _requestTimestamps = new();
+        private static readonly object _budgetLock = new();
+        private const int MaxRequestsPerWindow = 60;
+        private const int BudgetWindowMs = 60_000;
+        private static readonly Random _jitterRng = new();
 
         private static async Task ThrottleAsync(CancellationToken ct)
         {
             await ApiGate.WaitAsync(ct).ConfigureAwait(false);
             try
             {
+                // Enforce per-minute budget
+                await EnforceBudgetAsync(ct).ConfigureAwait(false);
+
                 var now = Environment.TickCount64;
                 var last = Interlocked.Read(ref _lastCallTicks);
                 var elapsed = now - last;
@@ -50,10 +60,36 @@ namespace Emby.InvidiousPlugin
                         .ConfigureAwait(false);
                 }
                 Interlocked.Exchange(ref _lastCallTicks, Environment.TickCount64);
+
+                // Record this request
+                lock (_budgetLock)
+                    _requestTimestamps.Enqueue(Environment.TickCount64);
             }
             finally
             {
                 ApiGate.Release();
+            }
+        }
+
+        private static async Task EnforceBudgetAsync(CancellationToken ct)
+        {
+            while (true)
+            {
+                ct.ThrowIfCancellationRequested();
+                lock (_budgetLock)
+                {
+                    var now = Environment.TickCount64;
+                    while (_requestTimestamps.Count > 0
+                           && (now - _requestTimestamps.Peek()) > BudgetWindowMs)
+                        _requestTimestamps.Dequeue();
+
+                    if (_requestTimestamps.Count < MaxRequestsPerWindow)
+                        return;
+                }
+                // Budget exhausted → wait before retrying
+                Debug.WriteLine(
+                    "[InvidiousApi] Request budget exhausted, waiting 3s...");
+                await Task.Delay(3000, ct).ConfigureAwait(false);
             }
         }
 
@@ -112,12 +148,14 @@ namespace Emby.InvidiousPlugin
 
                 lastStatus = resp.StatusCode;
 
-                // ── NEU: bei 429 (Too Many Requests) extra lang warten ──
+                // ── Bei 429 (Too Many Requests): exponentieller Backoff + Jitter ──
                 if (lastStatus == HttpStatusCode.TooManyRequests)
                 {
-                    var retryAfter = 5000 + (attempt * 3000); // 5s, 8s, 11s
+                    int baseDelay = 10_000 * (1 << attempt); // 10s, 20s, 40s
+                    int jitter = _jitterRng.Next(0, 3000);
+                    var retryAfter = Math.Min(baseDelay + jitter, 60_000);
                     Debug.WriteLine(
-                        $"[InvidiousApi] Rate limited (429), waiting {retryAfter}ms...");
+                        $"[InvidiousApi] Rate limited (429), attempt {attempt}, waiting {retryAfter}ms...");
                     await Task.Delay(retryAfter, ct).ConfigureAwait(false);
                     continue;
                 }
@@ -276,6 +314,25 @@ namespace Emby.InvidiousPlugin
         {
             var id = Uri.EscapeDataString(videoId ?? "");
             return GetJsonAsync(baseUrl, $"api/v1/videos/{id}", ct);
+        }
+
+        /// <summary>
+        /// Unthrottled video fetch for playback path — must not be delayed
+        /// by the enrichment rate limiter.
+        /// </summary>
+        public static async Task<JsonDocument> GetVideoDirectAsync(
+            string baseUrl, string videoId, CancellationToken ct)
+        {
+            var id = Uri.EscapeDataString(videoId ?? "");
+            var relativePath = $"api/v1/videos/{id}";
+            using var req = CreateGetRequest(baseUrl, relativePath);
+            using var resp = await Http.SendAsync(
+                req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+            resp.EnsureSuccessStatusCode();
+            await using var stream = await resp.Content
+                .ReadAsStreamAsync(ct).ConfigureAwait(false);
+            return await JsonDocument.ParseAsync(
+                stream, cancellationToken: ct).ConfigureAwait(false);
         }
 
         public static Task<JsonDocument?> TryGetVideoAsync(

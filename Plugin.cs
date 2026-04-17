@@ -14,7 +14,10 @@ namespace Emby.InvidiousPlugin
 {
     public class Plugin : BasePluginSimpleUI<PluginConfiguration>, IHasThumbImage
     {
-        public override string Name => "Invidious";
+        private static readonly string PluginVersion =
+            typeof(Plugin).Assembly.GetName().Version?.ToString(3) ?? "0.0.0";
+
+        public override string Name => $"Invidious v{PluginVersion}";
         public override string Description => "100% privacy-friendly YouTube via your self-hosted instance.";
         public override Guid Id => Guid.Parse("A1B2C3D4-E5F6-4A5B-8C9D-0E1F2A3B4C5D");
 
