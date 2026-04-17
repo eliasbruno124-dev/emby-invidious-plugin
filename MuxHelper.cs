@@ -24,6 +24,36 @@ namespace Emby.InvidiousPlugin
         // Prevents duplicate resume starts from the session monitor
         private static readonly ConcurrentDictionary<string, bool> ResumeInProgress = new();
 
+        // Cooldown: tracks when a resume last failed (503, connection error, etc.)
+        // so the monitor doesn't retry immediately.
+        private static readonly ConcurrentDictionary<string, DateTime> ResumeCooldowns = new();
+        private const int ResumeCooldownMs = 60_000; // wait 60s before retrying resume
+
+        // Tracks last time a playback file was accessed (by Emby reading the stream)
+        // Used as heartbeat for session detection since Emby doesn't populate
+        // NowPlayingItem for channel-based HLS streams.
+        private static readonly ConcurrentDictionary<string, DateTime> LastAccessTimestamps = new();
+
+        /// <summary>
+        /// Records a "heartbeat" for a video — called whenever Emby requests the
+        /// cached stream path or when playback.m3u8 is updated.
+        /// </summary>
+        private static void TouchAccess(string videoId)
+        {
+            LastAccessTimestamps[videoId] = DateTime.UtcNow;
+        }
+
+        /// <summary>
+        /// Returns true if a heartbeat for this video was recorded within
+        /// the given number of milliseconds.
+        /// </summary>
+        private static bool HasRecentAccess(string videoId, int withinMs)
+        {
+            if (LastAccessTimestamps.TryGetValue(videoId, out var ts))
+                return (DateTime.UtcNow - ts).TotalMilliseconds < withinMs;
+            return false;
+        }
+
         private static readonly object LogLock = new();
         private static CancellationTokenSource? _monitorCts;
 
@@ -421,6 +451,7 @@ namespace Emby.InvidiousPlugin
                 {
                     var result = File.Exists(playback) ? playback : m3u8;
                     Log($"GetCachedStreamPath: {videoId}_{height}p — complete cache ({segs} segs) → {Path.GetFileName(result)}");
+                    TouchAccess(videoId);
                     return result;
                 }
                 Log($"GetCachedStreamPath: {videoId}_{height}p — incomplete (endlist={hasEndlist}, segs={segs})");
@@ -440,6 +471,7 @@ namespace Emby.InvidiousPlugin
                     if (segs >= MinSegmentsForPlayback)
                     {
                         Log($"GetCachedStreamPath: {videoId}_{height}p — running process, {segs} segs ready");
+                        TouchAccess(videoId);
                         return playback;
                     }
                 }
@@ -519,6 +551,9 @@ namespace Emby.InvidiousPlugin
                 if (!File.Exists(sourcePath)) return;
                 var content = SafeReadAllText(sourcePath);
                 if (content == null) return;
+
+                // Strip DISCONTINUITY tags — Emby's HLS player stops/hangs at these boundaries
+                content = StripDiscontinuityTags(content);
 
                 if (!content.Contains("#EXT-X-ENDLIST"))
                     content += "\n#EXT-X-ENDLIST\n";
@@ -770,6 +805,26 @@ namespace Emby.InvidiousPlugin
             return count;
         }
 
+        /// <summary>
+        /// Removes all #EXT-X-DISCONTINUITY lines from an HLS playlist.
+        /// FFmpeg inserts these when resuming with append_list + seek,
+        /// but Emby's player stops/hangs at discontinuity boundaries.
+        /// </summary>
+        private static string StripDiscontinuityTags(string content)
+        {
+            if (!content.Contains("#EXT-X-DISCONTINUITY"))
+                return content;
+
+            var sb = new System.Text.StringBuilder(content.Length);
+            foreach (var line in content.Split('\n'))
+            {
+                if (line.TrimStart().StartsWith("#EXT-X-DISCONTINUITY", StringComparison.Ordinal))
+                    continue;
+                sb.Append(line).Append('\n');
+            }
+            return sb.ToString();
+        }
+
         private static int ParseHeightFromProcessKey(string processKey)
         {
             var lastUnderscore = processKey.LastIndexOf('_');
@@ -863,8 +918,13 @@ namespace Emby.InvidiousPlugin
                     // Already being resumed?
                     if (ResumeInProgress.ContainsKey(dirName)) continue;
 
+                    // Cooldown: skip if last resume attempt failed recently
+                    if (ResumeCooldowns.TryGetValue(dirName, out var cooldownUntil)
+                        && (DateTime.UtcNow - cooldownUntil).TotalMilliseconds < ResumeCooldownMs)
+                        continue;
+
                     // Is this video currently being played?
-                    if (!IsVideoBeingPlayed(videoId)) continue;
+                    if (!HasRecentAccess(videoId, GetSessionGraceMs()) && !IsVideoBeingPlayed(videoId)) continue;
 
                     // Read resume metadata
                     var metaFile = Path.Combine(dir, "_resume_meta.txt");
@@ -953,6 +1013,7 @@ namespace Emby.InvidiousPlugin
                             catch (Exception ex)
                             {
                                 Log($"SessionResumeMonitor: Resume failed for {capturedDirName}: {ex.Message}");
+                                ResumeCooldowns[capturedDirName] = DateTime.UtcNow;
                             }
                             finally
                             {
@@ -1198,13 +1259,13 @@ namespace Emby.InvidiousPlugin
                         $"-probesize 1M -analyzeduration 2M " +
                         $"{seekArg}" +
                         $"-reconnect 1 -reconnect_streamed 1 " +
-                        $"-reconnect_delay_max 5 " +
+                        $"-reconnect_delay_max 30 -reconnect_on_network_error 1 " +
                         $"-thread_queue_size 4096 " +
                         $"{headersArg}" +
                         $"-i \"{directVideoUrl}\" " +
                         $"{seekArg}" +
                         $"-reconnect 1 -reconnect_streamed 1 " +
-                        $"-reconnect_delay_max 5 " +
+                        $"-reconnect_delay_max 30 -reconnect_on_network_error 1 " +
                         $"-thread_queue_size 4096 " +
                         $"{headersArg}" +
                         $"-i \"{directAudioUrl}\" " +
@@ -1306,6 +1367,47 @@ namespace Emby.InvidiousPlugin
                                     Log($"Post-mux error for {processKey}: {ex.Message}");
                                 }
                             }
+                            else if (exitCode == 137 || exitCode == 9)
+                            {
+                                // Process was killed intentionally (SIGKILL=137/9)
+                                // StopAndMarkIdle already handled the idle marker.
+                                Log($"FFmpeg killed for {processKey}: exit={exitCode} (intentional stop)");
+                            }
+                            else
+                            {
+                                // FFmpeg crashed (I/O error, connection drop, 503, etc.)
+                                // Remove the #EXT-X-ENDLIST that FFmpeg wrote so the cache
+                                // is not mistaken for a complete mux. Write idle_stopped
+                                // marker so resume logic picks it up on next playback.
+                                try
+                                {
+                                    if (File.Exists(m3u8))
+                                    {
+                                        var content = File.ReadAllText(m3u8);
+                                        int segs = CountSegments(content);
+                                        if (content.Contains("#EXT-X-ENDLIST"))
+                                        {
+                                            content = content.Replace("#EXT-X-ENDLIST", "").TrimEnd() + "\n";
+                                            File.WriteAllText(m3u8, content);
+                                            Log($"FFmpeg error exit: removed ENDLIST from {processKey} ({segs} segs)");
+                                        }
+                                        var idleMarker = Path.Combine(videoDir, "idle_stopped");
+                                        if (!File.Exists(idleMarker))
+                                        {
+                                            SafeWriteAllText(idleMarker, $"{DateTime.UtcNow:O}\n{segs}");
+                                            Log($"FFmpeg error exit: marked {processKey} for resume ({segs} segs)");
+                                        }
+                                        UpdatePlaybackM3u8(m3u8, playback);
+                                    }
+                                    // Set cooldown so resume monitor waits before retrying
+                                    ResumeCooldowns[processKey] = DateTime.UtcNow;
+                                    Log($"FFmpeg error exit: cooldown set for {processKey} ({ResumeCooldownMs / 1000}s)");
+                                }
+                                catch (Exception ex)
+                                {
+                                    Log($"FFmpeg error-exit handler failed for {processKey}: {ex.Message}");
+                                }
+                            }
 
                             RunningProcesses.TryRemove(processKey, out _);
                             try { process.Dispose(); } catch { }
@@ -1340,20 +1442,28 @@ namespace Emby.InvidiousPlugin
                                     lastNewSegTime = DateTime.UtcNow;
                                 }
 
-                                // ── Session check every ~2s ──
+                                // ── Session check: use HTTP-access heartbeat ──
+                                // Emby doesn't populate NowPlayingItem for channel-based
+                                // HLS streams, so IsVideoBeingPlayed() always returns false.
+                                // Instead we track when GetCachedStreamPath was last called
+                                // for this video (= Emby is actively reading the stream).
                                 tickCounter++;
                                 if ((tickCounter % (SessionCheckMs / PlaybackUpdateIntervalMs)) == 0)
                                 {
-                                    if (IsVideoBeingPlayed(videoId))
+                                    if (HasRecentAccess(videoId, GetSessionGraceMs()) || IsVideoBeingPlayed(videoId))
                                         lastSessionSeen = DateTime.UtcNow;
                                 }
 
-                                bool activeSession = (DateTime.UtcNow - lastSessionSeen).TotalMilliseconds < GetSessionGraceMs();
-
-                                // During the initial grace period, assume session is active
-                                // (Emby needs 25-40s to populate NowPlayingItem for channel items)
+                                // During the initial grace period, assume session is active.
+                                // Also seed the access timestamp so the heartbeat chain starts.
                                 bool inInitialGrace = (DateTime.UtcNow - muxStartedAt).TotalMilliseconds < InitialGraceMs;
-                                if (inInitialGrace) activeSession = true;
+                                if (inInitialGrace)
+                                {
+                                    lastSessionSeen = DateTime.UtcNow;
+                                    TouchAccess(videoId);
+                                }
+
+                                bool activeSession = (DateTime.UtcNow - lastSessionSeen).TotalMilliseconds < GetSessionGraceMs();
 
                                 // ── Pre-buffer limit: no viewer → stop after X segments ──
                                 if (!activeSession && currentSegs >= GetPreBufferSegments())
