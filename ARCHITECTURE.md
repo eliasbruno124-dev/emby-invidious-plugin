@@ -1,52 +1,62 @@
-# Architecture Documentation for Emby-Invidious-Plugin
+# Architecture — Emby Invidious Plugin
 
 ## Overview
-The Emby-Invidious-Plugin is designed to integrate Invidious, an alternative front-end to YouTube, into the Emby media server. This document outlines the architecture, main components, design patterns utilized, and the overall code structure.
 
-## Components
-
-### 1. **Plugin Manager**
-The Plugin Manager is responsible for loading and managing plugin instances. It ensures that each instance is properly initialized and terminated, managing their lifecycle and interactions with the Emby server.
-
-### 2. **Invidious API Client**
-This component handles all communications with the Invidious instance. It is responsible for sending requests and processing responses, including error handling and retries for failed requests.
-
-### 3. **Media Item Handlers**
-These handlers are responsible for converting Invidious content into Emby-compatible media items. They handle metadata extraction and transformation, ensuring that the media items appear correctly within the Emby interface.
-
-### 4. **User Interface Extensions**
-This component enhances the Emby user interface to incorporate Invidious features. It adds new menu options, custom views for Invidious content, and other UI elements that improve user interaction.
-
-## Design Patterns
-The Emby-Invidious-Plugin employs several design patterns including:
-
-- **Singleton**: Used for the Plugin Manager to ensure a single instance manages all plugins.
-- **Factory Pattern**: Employed for creating various media item handlers based on the type of content being processed.
-- **Observer Pattern**: Used for event handling, allowing UI components to update in response to changes in the underlying data model.
+A privacy-friendly Emby plugin that integrates YouTube content via a self-hosted [Invidious](https://github.com/iv-org/invidious/) instance. No Google API keys required. Supports channels, playlists, search, trending, Shorts, and livestreams with full HLS muxing.
 
 ## Code Structure
 
 ```
 Emby-Invidious-Plugin/
-|-- src/
-|   |-- PluginManager.cs
-|   |-- InvidiousApiClient.cs
-|   |-- MediaItemHandlers/
-|   |   |-- VideoHandler.cs
-|   |   |-- PlaylistHandler.cs
-|   |-- UI/
-|   |   |-- MenuExtensions.cs
-|   |   |-- CustomViews/
-|   |       |-- InvidiousView.cs
-|-- README.md
-|-- LICENSE
-```  
+├── Plugin.cs                 # Plugin entry point, singleton instance, version display
+├── PluginConfiguration.cs    # All user-facing settings (EditableOptionsBase)
+├── InvidiousChannel.cs       # Channel provider — folder structure, video listing,
+│                              #   media info, Shorts/Live detection, thumbnails
+├── InvidiousApi.cs            # Static HTTP client, retry logic, all Invidious API
+│                              #   calls, thumbnail URL rewriting
+├── MuxHelper.cs               # FFmpeg HLS muxing, process lifecycle, segment caching,
+│                              #   watchdog, session detection, playback.m3u8 management
+├── thumb.png                  # Plugin logo shown in Emby dashboard
+└── Emby.InvidiousPlugin.csproj
+```
 
-### File Descriptions
-- **PluginManager.cs**: Implements the core logic for managing the plugin's lifecycle.
-- **InvidiousApiClient.cs**: Manages API calls to the Invidious service.
-- **MediaItemHandlers/**: Contains handlers for different types of media.
-- **UI/**: Contains modifications/extensions to the Emby user interface.
+## Key Components
 
-## Conclusion
-This document provides a high-level overview of the Emby-Invidious-Plugin architecture. For detailed implementation notes, refer to the individual component documentation in the repository.
+### Plugin.cs
+
+Plugin entry point implementing `BasePluginSimpleUI<PluginConfiguration>`. Holds the singleton `Instance`, resolves `ISessionManager` for playback session tracking, and exposes the plugin version from the assembly.
+
+### InvidiousChannel.cs
+
+Implements `IChannel` to provide the folder/video structure Emby displays. Responsibilities:
+
+- Resolves `@Handle`, `UC...` channel IDs, `PL...` playlists, and search queries
+- Fetches channel avatars and playlist thumbnails for the main menu
+- Detects Shorts (duration, aspect ratio, API flags) and livestreams (`liveNow`)
+- Builds `ChannelMediaInfo` entries with direct MP4 (480p/720p) and HLS (1080p/4K) sources
+- Trending folder: parallel fetch of Popular, Trending, Music, Gaming, Movies — deduplicated
+
+### InvidiousApi.cs
+
+Static HTTP client with automatic retry and error handling for all Invidious REST endpoints (`/api/v1/videos/`, `/channels/`, `/search`, `/trending`). Rewrites thumbnail URLs to proxy through the configured instance.
+
+### MuxHelper.cs
+
+Manages FFmpeg processes that mux adaptive video + audio into HLS segments. Key features:
+
+- **Watchdog loop**: Monitors FFmpeg health, segment progress, and viewer sessions
+- **Session detection**: Checks `ISessionManager` for active playback (`IsVideoBeingPlayed`) and HTTP-access heartbeat (`TouchAccess`/`HasRecentAccess`)
+- **Pre-buffer**: Muxes a configurable number of segments ahead, then pauses if no viewer is detected
+- **Cache management**: Segments persist on disk for configurable days; stale caches are cleaned on startup
+- **Error recovery**: Handles FFmpeg crashes, 503 errors from Invidious, and implements resume cooldowns
+- **Discontinuity stripping**: Removes `#EXT-X-DISCONTINUITY` tags from playlists after FFmpeg reconnects
+
+### PluginConfiguration.cs
+
+All settings exposed via Emby's plugin configuration UI: instance URL, content sources, trending region, sort order, quality (4K toggle), cache duration, FFmpeg path, and pre-buffer size.
+
+## Design Patterns
+
+- **Singleton**: `Plugin.Instance` provides global access to configuration and session manager
+- **Static helpers**: `InvidiousApi` and `MuxHelper` use static methods/dictionaries for process-wide state (active mux jobs, caches, cooldowns)
+- **Concurrent collections**: `ConcurrentDictionary` for mux job tracking, access timestamps, and resume cooldowns

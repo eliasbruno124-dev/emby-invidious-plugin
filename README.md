@@ -105,11 +105,24 @@ Go to your Emby Dashboard and open the "Invidious" plugin settings.
 |**Max Videos per Channel/Playlist**|50|1–150|Maximum videos loaded per channel or playlist|
 |**Max Videos per Search Query**|50|1–150|Maximum videos loaded per search query|
 
+### Quality
+
+|Setting|Default|Description|
+|-|-|-|
+|**Enable 4K (2160p)**|Off|Enable 4K video quality. When disabled, the maximum HLS quality is 1080p. Disable on hardware-weak systems to save CPU and bandwidth, as 4K VP9 muxing is significantly more demanding.|
+
 ### Caching
 
 |Setting|Default|Range|Description|
 |-|-|-|-|
 |**HLS Cache Duration (Days)**|3|0–30|How long to keep muxed HLS segments on disk. Set to 0 to delete all caches.|
+
+### Advanced / Performance
+
+|Setting|Default|Description|
+|-|-|-|
+|**FFmpeg Path**|*(auto-detect)*|Custom path to the FFmpeg executable. Leave empty to auto-detect (searches PATH and common install locations).|
+|**Pre-Buffer Segments**|90|Max HLS segments to pre-buffer when no one is actively watching. Each segment ≈ 4 seconds (default: ~6 min buffer). Range: 10–300.|
 
 \---
 
