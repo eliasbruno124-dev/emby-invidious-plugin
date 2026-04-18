@@ -1260,14 +1260,14 @@ namespace Emby.InvidiousPlugin
                         $"{seekArg}" +
                         $"-reconnect 1 -reconnect_streamed 1 " +
                         $"-reconnect_delay_max 30 -reconnect_on_network_error 1 " +
-                        $"-readrate 3 -readrate_initial_burst 120 " +
+                        $"-readrate 3 " +
                         $"-thread_queue_size 4096 " +
                         $"{headersArg}" +
                         $"-i \"{directVideoUrl}\" " +
                         $"{seekArg}" +
                         $"-reconnect 1 -reconnect_streamed 1 " +
                         $"-reconnect_delay_max 30 -reconnect_on_network_error 1 " +
-                        $"-readrate 3 -readrate_initial_burst 120 " +
+                        $"-readrate 3 " +
                         $"-thread_queue_size 4096 " +
                         $"{headersArg}" +
                         $"-i \"{directAudioUrl}\" " +
