@@ -1260,12 +1260,14 @@ namespace Emby.InvidiousPlugin
                         $"{seekArg}" +
                         $"-reconnect 1 -reconnect_streamed 1 " +
                         $"-reconnect_delay_max 30 -reconnect_on_network_error 1 " +
+                        $"-readrate 3 -readrate_initial_burst 120 " +
                         $"-thread_queue_size 4096 " +
                         $"{headersArg}" +
                         $"-i \"{directVideoUrl}\" " +
                         $"{seekArg}" +
                         $"-reconnect 1 -reconnect_streamed 1 " +
                         $"-reconnect_delay_max 30 -reconnect_on_network_error 1 " +
+                        $"-readrate 3 -readrate_initial_burst 120 " +
                         $"-thread_queue_size 4096 " +
                         $"{headersArg}" +
                         $"-i \"{directAudioUrl}\" " +
@@ -1318,6 +1320,7 @@ namespace Emby.InvidiousPlugin
 
                     _ = Task.Run(async () =>
                     {
+                        bool sawLsize = false;
                         try
                         {
                             using var reader = process.StandardError;
@@ -1330,6 +1333,8 @@ namespace Emby.InvidiousPlugin
                                     if (!string.IsNullOrEmpty(t)
                                         && !t.StartsWith("frame=", StringComparison.Ordinal))
                                         Log($"FFmpeg[{processKey}]: {t}");
+                                    if (t.Contains("Lsize="))
+                                        sawLsize = true;
                                 }
                             }
                         }
@@ -1344,6 +1349,11 @@ namespace Emby.InvidiousPlugin
                             catch (Exception ex)
                             {
                                 Log($"ExitCode read error for {processKey}: {ex.Message}");
+                            }
+                            if (exitCode == -1 && sawLsize)
+                            {
+                                Log($"FFmpeg finished for {processKey}: exit=-1 but Lsize detected → treating as success");
+                                exitCode = 0;
                             }
                             Log($"FFmpeg finished for {processKey}: exit={exitCode}");
 
