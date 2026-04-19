@@ -230,7 +230,7 @@ namespace Emby.InvidiousPlugin
             return (null, null, null);
         }
 
-        public static async Task<(string? name, string? thumb)> GetPlaylistDetailsAsync(
+        public static async Task<(string? name, string? thumb, int videoCount)> GetPlaylistDetailsAsync(
             string baseUrl, string id, CancellationToken ct)
         {
             try
@@ -238,11 +238,12 @@ namespace Emby.InvidiousPlugin
                 var escId = Uri.EscapeDataString(id);
                 using var doc = await TryGetJsonAsync(
                     baseUrl, $"api/v1/playlists/{escId}", ct).ConfigureAwait(false);
-                if (doc == null) return (null, null);
+                if (doc == null) return (null, null, 0);
                 var root = doc.RootElement;
                 var thumb = GetString(root, "playlistThumbnail")
                             ?? GetHighestResThumb(root, "playlistThumbnails");
-                return (GetString(root, "title"), thumb);
+                var count = root.TryGetProperty("videoCount", out var vc) && vc.TryGetInt32(out var n) ? n : 0;
+                return (GetString(root, "title"), thumb, count);
             }
             catch (Exception ex)
             {
@@ -250,7 +251,7 @@ namespace Emby.InvidiousPlugin
                     $"[InvidiousApi] GetPlaylistDetailsAsync failed for '{id}': " +
                     $"{ex.GetType().Name}: {ex.Message}");
             }
-            return (null, null);
+            return (null, null, 0);
         }
 
         public static Task<JsonDocument> SearchVideosAsync(

@@ -37,8 +37,9 @@ namespace Emby.InvidiousPlugin
 
         [DisplayName("Watch Later Playlist")]
         [Description(
-            "Playlist ID for a 'Watch Later' folder that auto-refreshes every ~5 minutes.\n" +
-            "Add videos to this playlist on Invidious/YouTube and they appear in Emby automatically.\n" +
+            "Playlist ID for a '⭐ Watch Later' folder with live refresh (~10 seconds).\n" +
+            "Add videos to this playlist on Invidious and they appear in Emby within ~15 seconds.\n" +
+            "Only the Invidious channel is refreshed — other channels stay untouched.\n" +
             "Example: PLxxxxxx")]
         public string WatchLaterPlaylist { get; set; } = "";
 

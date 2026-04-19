@@ -18,6 +18,7 @@ Plugin Screenshot
 
 * **🛡️ 100% Privacy:** No Google trackers, no API keys required. Everything runs locally through your Invidious instance.
 * **🔄 Seamless Playlist Syncing:** Log into your Invidious account and create a **public playlist**. Add its `PL...` ID to this plugin. Any video you add to that playlist via Invidious will automatically sync to your Emby dashboard!
+* **⭐ Watch Later with Live Refresh:** Configure a dedicated Watch Later playlist — the plugin polls it every **10 seconds** and refreshes only the Invidious channel when changes are detected. Add a video on Invidious, see it in Emby within ~15 seconds. No other channels are affected.
 * **🎯 Smart "@" Input:** A single, clean text field for all your content! Type `@GitHub` for channels, `PL123...` for playlists, or regular words for search queries.
 * **🖼️ Real Profile Pictures:** The plugin automatically fetches high-resolution channel avatars and playlist covers for the main menu.
 * **⏯️ "Continue Watching" Support:** Videos are internally declared as episodes. Emby perfectly remembers your exact progress (green progress bar) and displays unfinished videos on your home screen.
@@ -82,6 +83,7 @@ Go to your Emby Dashboard and open the "Invidious" plugin settings.
 |Setting|Description|
 |-|-|
 |**My YouTube Content**|Comma-separated list: `@Handle` for channels, `UCxxxxx` for channel IDs, `PLxxxxx` for playlists, any text for search queries|
+|**Watch Later Playlist**|Playlist ID for a ⭐ Watch Later folder with **10-second live refresh**. Add videos on Invidious → they appear in Emby within ~15 seconds. Only the Invidious channel is refreshed — other channels stay untouched.|
 
 *Example:* `@GitHub, PL0lo9MOBetEFcp4SCWinBdpml9B2U25-f, Linux Tutorials`
 
@@ -126,9 +128,15 @@ Go to your Emby Dashboard and open the "Invidious" plugin settings.
 
 \---
 
-## 🔄 Keeping Content Updated (Scheduled Tasks)
+## 🔄 Keeping Content Updated
 
-To fetch new videos from your saved channels and playlists, Emby uses an automated background task:
+### Watch Later (Real-Time)
+
+The **Watch Later playlist** is refreshed automatically every **10 seconds** — no configuration needed. When you add or remove a video on Invidious, it appears in Emby within ~15 seconds. Only the Invidious channel is refreshed; other channels are not affected.
+
+### All Other Content (Scheduled Task)
+
+To fetch new videos from your saved channels, playlists, and search queries, Emby uses an automated background task:
 
 1. Go to **Scheduled Tasks** in your Emby Dashboard.
 2. Look for the task named **Refresh Internet Channels**.
@@ -145,7 +153,7 @@ To fetch new videos from your saved channels and playlists, Emby uses an automat
 |`InvidiousApi.cs`|Static HTTP client with retry logic, all Invidious API calls, thumbnail rewriting|
 |`MuxHelper.cs`|FFmpeg HLS muxing, process management, segment caching, playback.m3u8 updates|
 |`PluginConfiguration.cs`|All user-facing settings with `EditableOptionsBase`|
-|`Plugin.cs`|Plugin entry point and instance holder|
+|`Plugin.cs`|Plugin entry point, Watch Later poller (10s polling + targeted `RefreshChannelContent` via reflection)|
 |`thumb.png`|Channel logo|
 
 \---

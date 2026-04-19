@@ -120,12 +120,15 @@ namespace Emby.InvidiousPlugin
                     {
                         var d = await InvidiousApi.GetPlaylistDetailsAsync(
                             baseUrl, watchLater, cancellationToken).ConfigureAwait(false);
+                        var thumbUrl = d.videoCount > 0 && !string.IsNullOrEmpty(d.thumb)
+                            ? d.thumb
+                            : $"{baseUrl}/apple-touch-icon.png";
                         items.Add(new ChannelItemInfo
                         {
                             Name = "\u2B50 " + (d.name ?? "Watch Later"),
                             Id = $"playlist{FolderSeparator}{watchLater}",
                             Type = ChannelItemType.Folder,
-                            ImageUrl = d.thumb
+                            ImageUrl = thumbUrl
                         });
                     }
 
