@@ -1,5 +1,6 @@
 using MediaBrowser.Controller.Channels;
 using MediaBrowser.Controller.Providers;
+using MediaBrowser.Model.Channels;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Drawing;
 using MediaBrowser.Model.Entities;
@@ -300,11 +301,7 @@ namespace Emby.InvidiousPlugin
                         }
 
                         foreach (var item in batch)
-                        {
-                            var pos = startIndex + items.Count + 1;
-                            item.IndexNumber = pos;
                             items.Add(item);
-                        }
 
                         if (items.Count >= limit) break;
                         if (batch.Count == 0 && !seeking) break;
@@ -540,9 +537,6 @@ namespace Emby.InvidiousPlugin
                     }
                 }
             }
-
-            for (int i = 0; i < allVideos.Count; i++)
-                allVideos[i].IndexNumber = i + 1;
 
             return new ChannelItemResult
             {
