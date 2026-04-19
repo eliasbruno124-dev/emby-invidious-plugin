@@ -24,7 +24,7 @@ namespace Emby.InvidiousPlugin
         public string Description => "Privacy-friendly YouTube via your Invidious instance.";
         public string Id => "invidious_channel_20";
 
-        public string DataVersion => "15.0.0";
+        public string DataVersion => "16.0.0";
         public ChannelParentalRating ParentalRating => ChannelParentalRating.GeneralAudience;
         public bool IsEnabledByDefault => true;
 
@@ -456,7 +456,7 @@ namespace Emby.InvidiousPlugin
             string? overview = null;
             if (!string.IsNullOrWhiteSpace(desc))
             {
-                overview = (views > 0 ? $"{views:N0} views\n\n" : "") + desc;
+                overview = views > 0 ? $"{desc}\n\n{views:N0} views" : desc;
                 item.Overview = overview;
             }
 
@@ -625,7 +625,7 @@ namespace Emby.InvidiousPlugin
                 string? overview = null;
                 if (!string.IsNullOrWhiteSpace(description))
                 {
-                    overview = (viewCount > 0 ? $"{viewCount:N0} views\n\n" : "") + description;
+                    overview = viewCount > 0 ? $"{description}\n\n{viewCount:N0} views" : description;
                 }
                 else if (viewCount > 0)
                 {
