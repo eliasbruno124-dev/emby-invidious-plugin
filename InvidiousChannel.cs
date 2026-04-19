@@ -20,7 +20,7 @@ namespace Emby.InvidiousPlugin
         public string Name => "Invidious";
         public string Description => "Privacy-friendly YouTube via your Invidious instance.";
         public string Id => "invidious_channel_20";
-        public string DataVersion => "11.0.0";
+        public string DataVersion => "13.0.0";
         public ChannelParentalRating ParentalRating => ChannelParentalRating.GeneralAudience;
         public bool IsEnabledByDefault => true;
 
@@ -35,7 +35,7 @@ namespace Emby.InvidiousPlugin
 
         private record VideoMeta(
             string? Overview, DateTime? Premiere, int? Year,
-            long? RuntimeTicks, DateTime CachedAt);
+            long? RuntimeTicks, string? ThumbUrl, DateTime CachedAt);
 
         private static readonly ConcurrentDictionary<string, VideoMeta> MetaCache = new();
         private static readonly TimeSpan MetaCacheTtl = TimeSpan.FromDays(365);
@@ -252,6 +252,22 @@ namespace Emby.InvidiousPlugin
                             if (items.Count + batch.Count >= limit) break;
                         }
 
+                        // ── Persist thumbnail URLs in MetaCache ──
+                        foreach (var item in batch)
+                        {
+                            if (string.IsNullOrEmpty(item.ImageUrl)) continue;
+                            var cacheId = item.Id;
+                            if (MetaCache.TryGetValue(cacheId, out var existing))
+                            {
+                                if (string.IsNullOrEmpty(existing.ThumbUrl))
+                                    MetaCache[cacheId] = existing with { ThumbUrl = item.ImageUrl };
+                            }
+                            else
+                            {
+                                MetaCache[cacheId] = new VideoMeta(null, null, null, null, item.ImageUrl, DateTime.UtcNow);
+                            }
+                        }
+
                         // ── Cache lookup + selective enrichment ──
                         ApplyCachedMeta(batch);
 
@@ -285,7 +301,8 @@ namespace Emby.InvidiousPlugin
 
                         foreach (var item in batch)
                         {
-                            item.Name = $"{(startIndex + items.Count + 1):D3} | {item.Name}";
+                            var pos = startIndex + items.Count + 1;
+                            item.IndexNumber = pos;
                             items.Add(item);
                         }
 
@@ -325,6 +342,12 @@ namespace Emby.InvidiousPlugin
             foreach (var item in batch)
             {
                 if (!MetaCache.TryGetValue(item.Id, out var cached)) continue;
+
+                // Restore cached thumbnail — survives Emby auto-refresh
+                // which can create DB items without downloading the image.
+                if (!string.IsNullOrEmpty(cached.ThumbUrl)
+                    && string.IsNullOrEmpty(item.ImageUrl))
+                    item.ImageUrl = cached.ThumbUrl;
 
                 // Always prefer cached overview (from full video API)
                 // — the list API only returns truncated descriptions.
@@ -400,8 +423,9 @@ namespace Emby.InvidiousPlugin
 
             if (vDoc == null)
             {
-                // Negative cache: don't retry
-                MetaCache[item.Id] = new VideoMeta(null, null, null, null, DateTime.UtcNow);
+                // Negative cache: don't retry — but preserve existing ThumbUrl
+                var prevThumb = MetaCache.TryGetValue(item.Id, out var prev) ? prev.ThumbUrl : null;
+                MetaCache[item.Id] = new VideoMeta(null, null, null, null, prevThumb, DateTime.UtcNow);
                 return;
             }
 
@@ -437,7 +461,14 @@ namespace Emby.InvidiousPlugin
                 item.RunTimeTicks = ticks;
             }
 
-            MetaCache[item.Id] = new VideoMeta(overview, premiere, year, ticks, DateTime.UtcNow);
+            // Preserve existing thumb or grab from enrichment response
+            var thumbUrl = MetaCache.TryGetValue(item.Id, out var mc) ? mc.ThumbUrl : null;
+            if (string.IsNullOrEmpty(thumbUrl))
+                thumbUrl = BestVideoThumbnail(r, videoId);
+            if (!string.IsNullOrEmpty(thumbUrl) && string.IsNullOrEmpty(item.ImageUrl))
+                item.ImageUrl = thumbUrl;
+
+            MetaCache[item.Id] = new VideoMeta(overview, premiere, year, ticks, thumbUrl, DateTime.UtcNow);
         }
 
         // ────────────────────────────────────────────────────────────
@@ -511,7 +542,7 @@ namespace Emby.InvidiousPlugin
             }
 
             for (int i = 0; i < allVideos.Count; i++)
-                allVideos[i].Name = $"{(i + 1):D3} | {allVideos[i].Name}";
+                allVideos[i].IndexNumber = i + 1;
 
             return new ChannelItemResult
             {
