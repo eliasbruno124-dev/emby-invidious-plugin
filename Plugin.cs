@@ -7,6 +7,7 @@ using MediaBrowser.Model.Drawing;
 using MediaBrowser.Model.Plugins;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -100,6 +101,7 @@ namespace Emby.InvidiousPlugin
     public class PluginEntryPoint : IServerEntryPoint
     {
         private Timer? _pollTimer;
+        private CancellationTokenSource? _pollCts;
         private string _lastVideoIds = "";
         private static object? _channelMgr;
         private static object? _registeredChannel;
@@ -109,6 +111,7 @@ namespace Emby.InvidiousPlugin
         public void Run()
         {
             InvidiousChannel.ScheduleSortNameFix();
+            _pollCts = new CancellationTokenSource();
             _pollTimer = new Timer(PollTick, null,
                 TimeSpan.FromSeconds(20),
                 TimeSpan.FromSeconds(10));
@@ -116,6 +119,10 @@ namespace Emby.InvidiousPlugin
 
         private void PollTick(object? state)
         {
+            var cts = _pollCts;
+            if (cts == null || cts.IsCancellationRequested) return;
+            var token = cts.Token;
+
             _ = Task.Run(async () =>
             {
                 try
@@ -127,9 +134,14 @@ namespace Emby.InvidiousPlugin
                     var baseUrl = (config.InvidiousUrl ?? "").TrimEnd('/');
                     if (string.IsNullOrEmpty(baseUrl)) return;
 
-                    var json = await PollHttp.GetStringAsync(
-                        $"{baseUrl}/api/v1/playlists/{Uri.EscapeDataString(playlist)}")
-                        .ConfigureAwait(false);
+                    using var req = new HttpRequestMessage(HttpMethod.Get,
+                        $"{InvidiousApi.GetCleanBaseUrl(baseUrl)}/api/v1/playlists/{Uri.EscapeDataString(playlist)}");
+                    var headers = InvidiousApi.BuildPlaybackHeaders(baseUrl);
+                    foreach (var h in headers)
+                        req.Headers.TryAddWithoutValidation(h.Key, h.Value);
+
+                    using var resp = await PollHttp.SendAsync(req, token).ConfigureAwait(false);
+                    var json = await resp.Content.ReadAsStringAsync(token).ConfigureAwait(false);
 
                     var ids = new List<string>();
                     foreach (Match m in Regex.Matches(json, @"""videoId""\s*:\s*""([^""]+)"""))
@@ -141,8 +153,12 @@ namespace Emby.InvidiousPlugin
 
                     _lastVideoIds = current;
                 }
-                catch { }
-            });
+                catch (OperationCanceledException) { }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[Plugin] PollTick failed: {ex.GetType().Name}: {ex.Message}");
+                }
+            }, token);
         }
 
         private static void TriggerRefresh()
@@ -175,7 +191,10 @@ namespace Emby.InvidiousPlugin
                 if (result is Task task)
                     task.Wait(TimeSpan.FromSeconds(60));
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Plugin] TriggerRefresh failed: {ex.GetType().Name}: {ex.Message}");
+            }
         }
 
         private static bool EnsureChannelManager()
@@ -190,7 +209,7 @@ namespace Emby.InvidiousPlugin
             foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
             {
                 try { iface = asm.GetTypes().FirstOrDefault(t => t.IsInterface && t.Name == "IChannelManager"); }
-                catch { }
+                catch (ReflectionTypeLoadException) { }
                 if (iface != null) break;
             }
             if (iface == null) return false;
@@ -230,7 +249,9 @@ namespace Emby.InvidiousPlugin
 
         public void Dispose()
         {
+            _pollCts?.Cancel();
             _pollTimer?.Dispose();
+            _pollCts?.Dispose();
             MuxHelper.Shutdown();
         }
     }

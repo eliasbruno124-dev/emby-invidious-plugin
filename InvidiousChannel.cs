@@ -8,6 +8,7 @@ using MediaBrowser.Model.MediaInfo;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -315,7 +316,7 @@ namespace Emby.InvidiousPlugin
                                     _ = Task.Run(async () =>
                                     {
                                         try { await EnrichVideosThrottled(bgUrl, background, CancellationToken.None).ConfigureAwait(false); EvictExpiredMetaCache(); }
-                                        catch { }
+                                        catch (Exception ex) { Debug.WriteLine($"[InvidiousChannel] Background enrich failed: {ex.GetType().Name}: {ex.Message}"); }
                                     });
                                 }
                             }
@@ -554,7 +555,7 @@ namespace Emby.InvidiousPlugin
                         _ = Task.Run(async () =>
                         {
                             try { await EnrichVideosThrottled(bgUrl, background, CancellationToken.None).ConfigureAwait(false); EvictExpiredMetaCache(); }
-                            catch { }
+                            catch (Exception ex) { Debug.WriteLine($"[InvidiousChannel] Background enrich failed: {ex.GetType().Name}: {ex.Message}"); }
                         });
                     }
                 }
@@ -570,7 +571,7 @@ namespace Emby.InvidiousPlugin
         private static async Task<JsonDocument?> SafeGetJson(Func<Task<JsonDocument>> factory)
         {
             try { return await factory().ConfigureAwait(false); }
-            catch { return null; }
+            catch (Exception ex) { Debug.WriteLine($"[InvidiousChannel] SafeGetJson failed: {ex.GetType().Name}: {ex.Message}"); return null; }
         }
 
         // ────────────────────────────────────────────────────────────
@@ -647,8 +648,9 @@ namespace Emby.InvidiousPlugin
                              && "short".Equals(genreProp.GetString(),
                                  StringComparison.OrdinalIgnoreCase))
                         isReel = true;
-                    else if (len.HasValue && len.Value > 0 && len.Value <= ReelMaxSeconds)
-                        isReel = true;
+                    // Length alone is not enough — many music videos are ≤3 min.
+                    // Only classify as Reel if the API didn't provide isShort/genre
+                    // AND the video has a vertical aspect ratio hint.
                 }
 
                 var thumb = BestVideoThumbnail(el, videoId!);
@@ -1126,7 +1128,7 @@ namespace Emby.InvidiousPlugin
                             return;
                     }
                 }
-                catch { }
+                catch (Exception ex) { Debug.WriteLine($"[InvidiousChannel] QuickWaitForFirstSegment error: {ex.GetType().Name}: {ex.Message}"); }
             }
             // Timeout → return anyway, Emby gets the source
         }
@@ -1333,7 +1335,7 @@ namespace Emby.InvidiousPlugin
                     await Task.Delay(15_000).ConfigureAwait(false);
                     FixSortNames();
                 }
-                catch { }
+                catch (Exception ex) { Debug.WriteLine($"[InvidiousChannel] FixSortNames failed: {ex.GetType().Name}: {ex.Message}"); }
                 finally { Interlocked.Exchange(ref _sortFixScheduled, 0); }
             });
         }

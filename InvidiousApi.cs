@@ -41,34 +41,32 @@ namespace Emby.InvidiousPlugin
         private static readonly object _budgetLock = new();
         private const int MaxRequestsPerWindow = 60;
         private const int BudgetWindowMs = 60_000;
-        private static readonly Random _jitterRng = new();
-
         private static async Task ThrottleAsync(CancellationToken ct)
         {
+            // Enforce per-minute budget (outside semaphore)
+            await EnforceBudgetAsync(ct).ConfigureAwait(false);
+
+            // Acquire concurrency slot — held until ReleaseThrottle()
             await ApiGate.WaitAsync(ct).ConfigureAwait(false);
-            try
-            {
-                // Enforce per-minute budget
-                await EnforceBudgetAsync(ct).ConfigureAwait(false);
 
-                var now = Environment.TickCount64;
-                var last = Interlocked.Read(ref _lastCallTicks);
-                var elapsed = now - last;
-                if (elapsed < MinCallIntervalMs)
-                {
-                    await Task.Delay((int)(MinCallIntervalMs - elapsed), ct)
-                        .ConfigureAwait(false);
-                }
-                Interlocked.Exchange(ref _lastCallTicks, Environment.TickCount64);
-
-                // Record this request
-                lock (_budgetLock)
-                    _requestTimestamps.Enqueue(Environment.TickCount64);
-            }
-            finally
+            var now = Environment.TickCount64;
+            var last = Interlocked.Read(ref _lastCallTicks);
+            var elapsed = now - last;
+            if (elapsed < MinCallIntervalMs)
             {
-                ApiGate.Release();
+                await Task.Delay((int)(MinCallIntervalMs - elapsed), ct)
+                    .ConfigureAwait(false);
             }
+            Interlocked.Exchange(ref _lastCallTicks, Environment.TickCount64);
+
+            // Record this request
+            lock (_budgetLock)
+                _requestTimestamps.Enqueue(Environment.TickCount64);
+        }
+
+        private static void ReleaseThrottle()
+        {
+            ApiGate.Release();
         }
 
         private static async Task EnforceBudgetAsync(CancellationToken ct)
@@ -133,26 +131,32 @@ namespace Emby.InvidiousPlugin
 
                 // ── Rate Limit vor jedem Call ──
                 await ThrottleAsync(ct).ConfigureAwait(false);
-
-                using var req = CreateGetRequest(baseUrl, relativePath);
-                using var resp = await Http.SendAsync(
-                    req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
-
-                if (resp.IsSuccessStatusCode)
+                try
                 {
-                    await using var stream = await resp.Content
-                        .ReadAsStreamAsync(ct).ConfigureAwait(false);
-                    return await JsonDocument.ParseAsync(
-                        stream, cancellationToken: ct).ConfigureAwait(false);
-                }
+                    using var req = CreateGetRequest(baseUrl, relativePath);
+                    using var resp = await Http.SendAsync(
+                        req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
 
-                lastStatus = resp.StatusCode;
+                    if (resp.IsSuccessStatusCode)
+                    {
+                        await using var stream = await resp.Content
+                            .ReadAsStreamAsync(ct).ConfigureAwait(false);
+                        return await JsonDocument.ParseAsync(
+                            stream, cancellationToken: ct).ConfigureAwait(false);
+                    }
+
+                    lastStatus = resp.StatusCode;
+                }
+                finally
+                {
+                    ReleaseThrottle();
+                }
 
                 // ── Bei 429 (Too Many Requests): exponentieller Backoff + Jitter ──
                 if (lastStatus == HttpStatusCode.TooManyRequests)
                 {
                     int baseDelay = 10_000 * (1 << attempt); // 10s, 20s, 40s
-                    int jitter = _jitterRng.Next(0, 3000);
+                    int jitter = Random.Shared.Next(0, 3000);
                     var retryAfter = Math.Min(baseDelay + jitter, 60_000);
                     Debug.WriteLine(
                         $"[InvidiousApi] Rate limited (429), attempt {attempt}, waiting {retryAfter}ms...");
@@ -308,13 +312,6 @@ namespace Emby.InvidiousPlugin
             var id = Uri.EscapeDataString(playlistId ?? "");
             return GetJsonAsync(baseUrl,
                 $"api/v1/playlists/{id}?page={page}", ct);
-        }
-
-        public static Task<JsonDocument> GetVideoAsync(
-            string baseUrl, string videoId, CancellationToken ct)
-        {
-            var id = Uri.EscapeDataString(videoId ?? "");
-            return GetJsonAsync(baseUrl, $"api/v1/videos/{id}", ct);
         }
 
         /// <summary>
