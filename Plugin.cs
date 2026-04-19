@@ -23,13 +23,21 @@ namespace Emby.InvidiousPlugin
 
         public static Plugin? Instance { get; private set; }
         public static ISessionManager? SessionManager { get; private set; }
+        public static string? LibraryDbPath { get; private set; }
 
         public Plugin(IApplicationHost applicationHost) : base(applicationHost)
         {
             Instance = this;
+            try { SessionManager = applicationHost.Resolve<ISessionManager>(); } catch { }
             try
             {
-                SessionManager = applicationHost.Resolve<ISessionManager>();
+                var paths = applicationHost.Resolve<IServerApplicationPaths>();
+                if (paths != null)
+                {
+                    var candidate = Path.Combine(paths.DataPath, "library.db");
+                    if (File.Exists(candidate))
+                        LibraryDbPath = candidate;
+                }
             }
             catch { }
         }
@@ -83,7 +91,10 @@ namespace Emby.InvidiousPlugin
 
     public class PluginEntryPoint : IServerEntryPoint
     {
-        public void Run() { }
+        public void Run()
+        {
+            InvidiousChannel.ScheduleSortNameFix();
+        }
 
         public void Dispose()
         {

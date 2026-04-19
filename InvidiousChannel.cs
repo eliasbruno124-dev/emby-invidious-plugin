@@ -10,6 +10,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -195,8 +196,10 @@ namespace Emby.InvidiousPlugin
                     if (type == "trending")
                     {
                         string region = (config.TrendingRegion ?? "").Trim();
-                        return await LoadTrending(baseUrl, cancellationToken, region)
+                        var trendingResult = await LoadTrending(baseUrl, cancellationToken, region)
                             .ConfigureAwait(false);
+                        ScheduleSortNameFix();
+                        return trendingResult;
                     }
 
                     int startIndex = query.StartIndex ?? 0;
@@ -316,6 +319,7 @@ namespace Emby.InvidiousPlugin
                         ? startIndex + items.Count + 1
                         : startIndex + items.Count;
 
+                    ScheduleSortNameFix();
                     return new ChannelItemResult
                     {
                         Items = items,
@@ -1287,6 +1291,59 @@ namespace Emby.InvidiousPlugin
                 Items = items,
                 TotalRecordCount = items.Count
             };
+        }
+        // ────────────────────────────────────────────────────────────
+        //  SortName fix: default sort = newest first
+        //  Emby generates SortName from Name (alphabetical).
+        //  We override it with an inverted-date prefix so that
+        //  the default "Title" sort shows newest videos first.
+        // ────────────────────────────────────────────────────────────
+        [DllImport("sqlite3")] private static extern int sqlite3_open(string filename, out IntPtr db);
+        [DllImport("sqlite3")] private static extern int sqlite3_exec(IntPtr db, string sql, IntPtr cb, IntPtr arg, out IntPtr errmsg);
+        [DllImport("sqlite3")] private static extern int sqlite3_close(IntPtr db);
+        [DllImport("sqlite3")] private static extern void sqlite3_free(IntPtr ptr);
+
+        private static int _sortFixScheduled;
+
+        internal static void ScheduleSortNameFix()
+        {
+            if (Interlocked.CompareExchange(ref _sortFixScheduled, 1, 0) != 0) return;
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(15_000).ConfigureAwait(false);
+                    FixSortNames();
+                }
+                catch { }
+                finally { Interlocked.Exchange(ref _sortFixScheduled, 0); }
+            });
+        }
+
+        private static void FixSortNames()
+        {
+            var dbPath = Plugin.LibraryDbPath;
+            if (string.IsNullOrEmpty(dbPath) || !File.Exists(dbPath)) return;
+
+            if (sqlite3_open(dbPath, out var db) != 0) return;
+            try
+            {
+                sqlite3_exec(db, "PRAGMA busy_timeout = 5000;", IntPtr.Zero, IntPtr.Zero, out _);
+
+                const string sql = @"
+                    UPDATE MediaItems
+                    SET SortName = printf('%010d', 9999999999 - COALESCE(PremiereDate, DateCreated, 0))
+                                   || ' ' || SortName
+                    WHERE type = 8
+                      AND PremiereDate IS NOT NULL
+                      AND ExternalId IS NOT NULL
+                      AND (length(ExternalId) = 11 OR ExternalId LIKE 'LIVE_%' OR ExternalId LIKE 'REEL_%')
+                      AND SortName NOT GLOB '[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9] *'";
+
+                sqlite3_exec(db, sql, IntPtr.Zero, IntPtr.Zero, out var errmsg);
+                if (errmsg != IntPtr.Zero) sqlite3_free(errmsg);
+            }
+            finally { sqlite3_close(db); }
         }
     }
 }
