@@ -22,7 +22,8 @@ namespace Emby.InvidiousPlugin
         public string Name => "Invidious";
         public string Description => "Privacy-friendly YouTube via your Invidious instance.";
         public string Id => "invidious_channel_20";
-        public string DataVersion => "13.0.0";
+
+        public string DataVersion => "15.0.0";
         public ChannelParentalRating ParentalRating => ChannelParentalRating.GeneralAudience;
         public bool IsEnabledByDefault => true;
 
@@ -114,6 +115,20 @@ namespace Emby.InvidiousPlugin
             {
                 if (string.IsNullOrEmpty(query.FolderId))
                 {
+                    var watchLater = (config.WatchLaterPlaylist ?? "").Trim();
+                    if (watchLater.Length > 2)
+                    {
+                        var d = await InvidiousApi.GetPlaylistDetailsAsync(
+                            baseUrl, watchLater, cancellationToken).ConfigureAwait(false);
+                        items.Add(new ChannelItemInfo
+                        {
+                            Name = "\u2B50 " + (d.name ?? "Watch Later"),
+                            Id = $"playlist{FolderSeparator}{watchLater}",
+                            Type = ChannelItemType.Folder,
+                            ImageUrl = d.thumb
+                        });
+                    }
+
                     if (config.ShowTrending)
                         items.Add(new ChannelItemInfo
                         {

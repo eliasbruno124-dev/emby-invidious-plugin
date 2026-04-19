@@ -35,6 +35,13 @@ namespace Emby.InvidiousPlugin
             "Example: @GitHub, PLxxxxxx, Linux Tutorials")]
         public string SavedItems { get; set; } = "";
 
+        [DisplayName("Watch Later Playlist")]
+        [Description(
+            "Playlist ID for a 'Watch Later' folder that auto-refreshes every ~5 minutes.\n" +
+            "Add videos to this playlist on Invidious/YouTube and they appear in Emby automatically.\n" +
+            "Example: PLxxxxxx")]
+        public string WatchLaterPlaylist { get; set; } = "";
+
         // ─────────────────────────────────────────────────────────────────────
         // DISCOVER
         // ─────────────────────────────────────────────────────────────────────
